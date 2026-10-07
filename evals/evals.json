@@ -1,0 +1,23 @@
+{
+  "skill_name": "citation-snowball",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I really like the HQ-SAM paper (https://arxiv.org/abs/2306.01567). Can you do a forward and backward citation search and give me a markdown list of the influential related papers with code?",
+      "expected_output": "A report.md whose comparison set lists SAM, CascadePSP, CRM, CoOp, AIM and LoRA as baselines; Section 1 contains SAM (facebookresearch/segment-anything) and segmentation-refinement follow-ups such as SegRefiner; every row has a one-sentence difference from HQ-SAM.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Find the datasets that 'SPIN: Hierarchical Segmentation with Subpart Granularity in Natural Images' compares against, then the influential papers that cite those datasets, with GitHub links. Only keep papers with at least 50 citations.",
+      "expected_output": "Paper type treated as dataset; compared datasets include PartImageNet, PartNet and ADE20K; the forward search uses --min-citations 50; the report lists part-segmentation work with code first.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "What should I compare DoRA (arXiv 2402.09353) against, and who has built on it since? Save the result as dora-related.md.",
+      "expected_output": "Baselines from DoRA's results tables (LoRA and other PEFT methods) in the comparison set; forward papers citing DoRA or several PEFT baselines; report saved to dora-related.md with code links and differences.",
+      "files": []
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# run folders the script creates when invoked from inside the repo
+fbsearch-*/

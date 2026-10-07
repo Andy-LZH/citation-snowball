@@ -1,0 +1,6 @@
+interface:
+  display_name: "Citation Snowball"
+  short_description: "Map a paper's baselines, citers and code"
+  default_prompt: "Use $citation-snowball on this paper: "
+policy:
+  allow_implicit_invocation: true
