@@ -1,4 +1,4 @@
-"""The version number lives in three places; a release must bump all of them (see CONTRIBUTING.md)."""
+"""The version number lives in four places; a release must bump all of them (see CONTRIBUTING.md)."""
 import os
 import re
 import unittest
@@ -39,7 +39,7 @@ class VersionConsistency(unittest.TestCase):
                    for line in read("examples/instructpart.md").split("\n")}
         quoted = [line[2:] for line in read("README.md").split("\n")
                   if re.match(r"> (\| |\d+\. |   [↩↪])", line)]
-        self.assertGreater(len(quoted), 10)
+        self.assertGreaterEqual(len(quoted), 4)
         for line in quoted:
             self.assertIn(line, example, "README quotes a line the example map no longer has: %s" % line[:80])
 

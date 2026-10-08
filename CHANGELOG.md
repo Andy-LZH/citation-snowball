@@ -7,6 +7,12 @@ what counts as major, minor and patch here.
 
 ## [Unreleased]
 
+### Changed
+
+- **A shorter README, in the order you need it:** prerequisites (with where to get a Semantic Scholar key), then
+  install (the Claude Code plugin first), use, and what you get. The flow diagram and the limitations moved to
+  [`references/methodology.md`](references/methodology.md).
+
 ## [1.4.0] - 2026-10-08
 
 **Know when there is something new.** The skill now tells you when a newer release is out, in every agent that runs

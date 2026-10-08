@@ -111,7 +111,7 @@ Include:
    The 1.3.0 calibration used InstructPart (`2505.18291`) and InstructPart + SPIN (`2407.09686`).
 2. **For each seed:** the section counts before and after, and the papers gained and lost, with a sentence on why
    the new list is better. The CHANGELOG entry for 1.3.0 shows the expected level of detail.
-3. **Updated docs:** the tests, the gate tables in SKILL.md, README and CHANGELOG, and the methodology reference.
+3. **Updated docs:** the tests, the gate tables in SKILL.md and the methodology reference, and CHANGELOG.
 
 ## Changing SKILL.md
 
