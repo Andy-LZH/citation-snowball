@@ -3,14 +3,19 @@
 
 Stages (each reads/writes JSON in a work directory):
 
-  backward SEED  resolve the seed paper, digest its full text (tables, related work, citation sentences), fetch its
+  backward SEED [SEED ...]
+                 resolve each seed paper, digest its full text (tables, related work, citation sentences), fetch its
                  references (recovering ones Semantic Scholar lacks from the bibliography) and propose the core
-                 comparison set                       -> seed.json digest.json fulltext.txt refs.json core.json
-  forward        gather candidates (citers of the seed, newest citers of each core paper, a citation-sorted topic
-                 search, optionally OpenAlex's most-cited citers), verify each candidate's reference list, apply
-                 the citation threshold, fetch abstracts and code links (GitHub / Hugging Face)
-                                                      -> candidates.json briefs.md
-  report         render the markdown report, merging the agent-written diffs.json -> report.md
+                 comparison set, merged across seeds
+                                -> seeds.json core.json seeds/<key>/{seed,refs,digest,core}.json fulltext.txt
+  core           show or edit the merged core set
+  forward        backward co-citation (what the seeds and their compared works all cite); route B, the papers citing
+                 the seeds (widened to on-topic papers citing the compared works when too few pass); then forward
+                 co-citation (what the area's recent papers cite). Verifies reference lists and probes GitHub stars /
+                 README docs, saves the whole screened pool, then runs `select`      -> pool.json (+ select's outputs)
+  select         apply the influence gates and size caps to pool.json (offline apart from cached lookups), fetch
+                 abstracts, BibTeX and code for the kept papers -> candidates.json briefs.md
+  report         render the reading map, merging the agent-written diffs.json -> report.md references.bib
 
 Helpers: doctor (check APIs, keys, tools) | resolve SEED | code ID... (debug code discovery)
 
@@ -20,6 +25,8 @@ Standard library only (Python 3.8+). Needs network access.
 from __future__ import annotations
 
 import argparse
+import bisect
+import collections
 import datetime as dt
 import hashlib
 import json
@@ -38,19 +45,59 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 S2 = "https://api.semanticscholar.org/graph/v1"
 OPENALEX = "https://api.openalex.org"
 UA = "citation-snowball/%s (+https://github.com/Andy-LZH/citation-snowball; python-urllib)" % VERSION
 MISSING = "\x00missing\x00"
-HUB_MIN_CITATIONS = 5000  # core papers above max(this, 10x the seed's citations) count half toward relevance
+# Core papers above max(this, 10x the most-cited seed's citations) count half toward relevance, and widening does not
+# fetch their citers: nearly every paper in the area cites SAM, CLIP or DINOv2, so their citers are noise.
+HUB_MIN_CITATIONS = 5000
 SURVEY_RE = re.compile(r"\b(survey|review|overview|tutorial|primer)\b", re.I)
+
+# Influence gates for forward papers: route -> age bracket -> (min citations, min GitHub stars). A paper passes when it
+# is in the bracket and has either enough citations, or enough stars on a verified repo whose README scores at least
+# --min-docs (twice the stars when the README could not be read). "seed" = a paper citing a seed, "expand" = a paper
+# citing a compared work, added to section B only when too few papers cite the seed. "any" applies at every age. "old"
+# means older than the mid bracket; it is closed (None) by default because widening is for recent work, and when
+# reopened it also needs
+# citations of at least 2 core papers. Calibrated on a 2025 benchmark seed (InstructPart): see CHANGELOG 1.3.0.
+# Override with --gate ROUTE.BRACKET=CITES[,STARS]; "-" closes a bracket or its stars route.
+GATES = {
+    "seed.any": (50, 1000),
+    "seed.recent": (10, 100),
+    "seed.mid": (25, 250),
+    "expand.recent": (20, 150),
+    "expand.mid": (40, 250),
+    "expand.old": (None, None),
+}
+TABLE_ROLES = ("baseline", "benchmarked_model", "compared_dataset", "compared_benchmark")
+
+# Co-citation, in two directions. Backward: what the seeds and their compared works cite (k_b of n_b of them).
+# Forward: what the area's recent papers cite - papers of the last --latest-months that cite a seed, or cite a compared
+# work and match the topic - as a share of those published after the cited paper (only they could cite it).
+# Calibrated on InstructPart: ADE20K is cited by 6 of its 15 (seed + compared works); SAM 3, Qwen3-VL and Qwen2.5-VL by
+# 22-25% of the on-topic papers published after them.
+COCITE = {
+    "k_share": 0.2,           # foundations, path (a): cited by at least 20% of the seeds + compared works ...
+    "k_min": 3,               # ... and at least 3 of them,
+    "confirm_share": 0.05,    # ... and confirmed by at least 5% of recent area papers ...
+    "confirm_support": 3,     # ... and at least 3 of them
+    "consensus_share": 0.25,  # foundations, path (b): older papers cited by at least 25% of recent area papers
+    "min_citations": 100,     # foundations are influential themselves
+    "latest_share": 0.15,     # latest models: cited by at least 15% of the area papers published after them ...
+    "latest_support": 4,      # ... at least 4 of them ...
+    "min_eligible": 10,       # ... out of at least 10 that could have cited them
+    "coupling_top": 30,       # same-area check: the 30 strongest backward co-citations
+}
+S2_CORPUS = 214_000_000  # papers in Semantic Scholar: the specificity weight is log(S2_CORPUS / citations)
 # Keyless Semantic Scholar shares one rate-limited pool with every other keyless user, so most requests get 429 at
 # busy times. Keep retrying one request for up to this many seconds before giving up.
 S2_PATIENCE = float(os.environ.get("FBS_S2_PATIENCE", "900"))
 
 PAPER_FIELDS = "paperId,title,year,venue,publicationDate,citationCount,influentialCitationCount,externalIds"
 DETAIL_FIELDS = PAPER_FIELDS + ",abstract,tldr,publicationTypes,openAccessPdf,authors,url"
+KEPT_FIELDS = DETAIL_FIELDS + ",citationStyles"  # kept papers also get BibTeX
 REF_FIELDS = "contexts,intents,isInfluential," + PAPER_FIELDS
 CIT_FIELDS = "intents,isInfluential," + PAPER_FIELDS
 
@@ -298,14 +345,6 @@ def months_old(paper: dict, today: dt.date) -> int | None:
     return (today.year - y) * 12 + (today.month - m)
 
 
-def passes_threshold(paper: dict, cfg: dict, today: dt.date) -> bool:
-    cites = paper.get("citationCount") or 0
-    if cites >= cfg["min_citations"]:
-        return True
-    age = months_old(paper, today)
-    return age is not None and age <= cfg["recent_months"] and cites >= cfg["recent_min_citations"]
-
-
 def paper_link(p: dict) -> str:
     ext = p.get("externalIds") or {}
     if ext.get("ArXiv"):
@@ -421,14 +460,15 @@ def s2_edges(http: Http, pid: str, kind: str, fields: str, cap: int) -> list:
     return out
 
 
-def s2_bulk_search(http: Http, query: str, min_citations: int, limit: int, year: str | None = None) -> list:
-    """Papers matching a boolean query (+ | - "phrase" prefix*), most cited first."""
+def s2_bulk_search(http: Http, query: str, min_citations: int, limit: int, since: str | None = None) -> list:
+    """Papers matching a boolean query (+ | - "phrase" prefix*), most cited first; optionally only those published on
+    or after `since` (YYYY-MM-DD)."""
     out, token = [], None
     while len(out) < limit:
         params = {"query": query, "fields": PAPER_FIELDS, "sort": "citationCount:desc",
                   "minCitationCount": min_citations}
-        if year:
-            params["year"] = year
+        if since:
+            params["publicationDateOrYear"] = since + ":"
         if token:
             params["token"] = token
         try:
@@ -1304,7 +1344,7 @@ def github_token() -> str | None:
     return None
 
 
-def github_repo_info(http: Http, repos: list, token: str | None) -> dict:
+def github_repo_info(http: Http, repos: list, token: str | None, rest_budget: int = 55) -> dict:
     info, uniq = {}, sorted({r.lower(): r for r in repos}.values())
     if token:
         for start in range(0, len(uniq), 40):
@@ -1313,7 +1353,7 @@ def github_repo_info(http: Http, repos: list, token: str | None) -> dict:
             for j, full in enumerate(chunk):
                 owner, name = full.split("/", 1)
                 parts.append("r%d: repository(owner: %s, name: %s) { nameWithOwner stargazerCount url isArchived "
-                             "pushedAt description homepageUrl }" % (j, json.dumps(owner), json.dumps(name)))
+                             "pushedAt createdAt description homepageUrl }" % (j, json.dumps(owner), json.dumps(name)))
             try:
                 res = http.fetch("https://api.github.com/graphql", data={"query": "query { %s }" % " ".join(parts)},
                                  headers={"Authorization": "bearer " + token}, ttl_days=3)
@@ -1326,10 +1366,11 @@ def github_repo_info(http: Http, repos: list, token: str | None) -> dict:
                 if r:
                     info[full.lower()] = {"repo": r["nameWithOwner"], "url": r["url"], "stars": r["stargazerCount"],
                                           "archived": r["isArchived"], "pushed": (r.get("pushedAt") or "")[:10],
+                                          "created": (r.get("createdAt") or "")[:10],
                                           "description": (r.get("description") or "")[:200],
                                           "homepage": r.get("homepageUrl") or ""}
         return info
-    for full in uniq[:55]:  # unauthenticated REST allows 60 calls/hour
+    for full in uniq[:rest_budget]:  # unauthenticated REST allows 60 calls/hour
         try:
             r = http.fetch("https://api.github.com/repos/%s" % full, ttl_days=3)
         except HttpFailure as err:
@@ -1338,15 +1379,71 @@ def github_repo_info(http: Http, repos: list, token: str | None) -> dict:
         if r:
             info[full.lower()] = {"repo": r["full_name"], "url": r["html_url"], "stars": r["stargazers_count"],
                                   "archived": r.get("archived", False), "pushed": (r.get("pushed_at") or "")[:10],
+                                  "created": (r.get("created_at") or "")[:10],
                                   "description": (r.get("description") or "")[:200]}
-    if len(uniq) > 55:
-        log("  (no GitHub token: star counts fetched for the first 55 repos only; run `gh auth login` for more)")
+    if len(uniq) > rest_budget:
+        log("  (no GitHub token: star counts fetched for the first %d repos only; run `gh auth login` for more)"
+            % rest_budget)
     return info
 
 
-def hf_artifacts(http: Http, arxiv_id: str, title: str, gh_owners: set) -> list:
-    """Hugging Face models/datasets/spaces tagged with this arXiv id that plausibly belong to the paper."""
-    name = alnum(short_name(title) or "")
+# How completely a README documents the implementation. A check counts when a heading matches, or the text matches
+# at least twice. Calibrated on 72 repos from a part-segmentation search: most maintained ML repos score 4-5, a stub
+# README 0-1, and a project whose docs live elsewhere (e.g. a simulator) 2.
+DOCS_CHECKS = (
+    ("setup", r"\b(install(ation|ing)?|setup|set up|requirements?|environment|dependenc(y|ies)|getting started|"
+              r"pip install|conda (create|env|install)|docker)\b"),
+    ("usage", r"\b(usage|inference|demo|quick ?start|examples?|how to (use|run)|predict(ion)?|run(ning)? the)\b"),
+    ("training", r"\b(train(ing)?|fine-?tun(e|ing))\b"),
+    ("evaluation", r"\b(evaluat(e|ion)|reproduc(e|ing|tion)|benchmark(ing)?|test(ing)? (set|on))\b"),
+    ("weights", r"\b(checkpoints?|pre-?trained|weights|model zoo|download)\b|huggingface\.co/"),
+)
+
+
+def docs_score(readme: str | None) -> tuple:
+    """-> (0-5, the checks that passed): setup, usage, training, evaluation and released weights. (None, []) when
+    there is no README to judge."""
+    if not readme:
+        return None, []
+    headings = "\n".join(line for line in readme.splitlines()
+                         if line.lstrip().startswith("#") or re.match(r"\s*<h\d", line, re.I))
+    hits = [name for name, pattern in DOCS_CHECKS
+            if re.search(pattern, headings, re.I) or len(re.findall(pattern, readme, re.I)) >= 2]
+    return len(hits), hits
+
+
+def github_readme(http: Http, full: str, token: str | None) -> str | None:
+    """The repo's README as raw text. Uses the API with a token; without one, raw.githubusercontent.com (no quota)."""
+    try:
+        if token:
+            return http.fetch("https://api.github.com/repos/%s/readme" % full, as_json=False, ttl_days=7,
+                              headers={"Authorization": "bearer " + token, "Accept": "application/vnd.github.raw+json"})
+        for name in ("README.md", "readme.md", "README.rst"):
+            text = http.fetch("https://raw.githubusercontent.com/%s/HEAD/%s" % (full, name), as_json=False, ttl_days=7)
+            if text:
+                return text
+    except HttpFailure as err:
+        log("  README lookup failed for %s: %s" % (full, err))
+    return None
+
+
+def add_docs(http: Http, papers: list, token: str | None, min_stars: int = 0) -> None:
+    """Score the README of each paper's first verified repo with at least `min_stars` stars (in place)."""
+    for p in papers:
+        gh = [g for g in ((p.get("code") or {}).get("github") or []) if "verify" not in (g.get("source") or "")]
+        if gh and (gh[0].get("stars") or 0) >= min_stars and "docs" not in gh[0]:
+            gh[0]["docs"], gh[0]["docs_hits"] = docs_score(github_readme(http, gh[0]["repo"], token))
+
+
+def hf_artifacts(http: Http, arxiv_id: str, title: str, gh_repos: list) -> list:
+    """Hugging Face models / datasets / spaces tagged with this arXiv id that belong to the paper.
+
+    Any model card can cite a paper (Microsoft's Magma-8B cites Set-of-Mark), so an artifact counts only when its id
+    carries the paper's short name or its repo's name, or it cites no other arXiv paper. It is verified when its owner
+    also owns the paper's verified GitHub repo, and listed as unverified otherwise.
+    """
+    owners = {r.split("/")[0].lower() for r in gh_repos}
+    names = {n for n in [alnum(short_name(title) or "")] + [alnum(r.split("/", 1)[1]) for r in gh_repos] if len(n) >= 3}
     found = []
     for kind in ("models", "datasets", "spaces"):
         try:
@@ -1357,13 +1454,14 @@ def hf_artifacts(http: Http, arxiv_id: str, title: str, gh_owners: set) -> list:
             continue
         for row in rows:
             rid = row.get("id") or row.get("modelId") or ""
-            owner = rid.split("/")[0].lower()
-            by_owner = owner in gh_owners  # same owner as the paper's verified GitHub repo
-            if by_owner or (len(name) >= 3 and name in alnum(rid)):
-                prefix = {"models": "", "datasets": "datasets/", "spaces": "spaces/"}[kind]
-                found.append({"kind": kind[:-1], "id": rid, "likes": row.get("likes") or 0, "verified": by_owner,
-                              "url": "https://huggingface.co/%s%s" % (prefix, rid)})
-                break  # best (most liked) plausible artifact of this kind
+            cites = {t for t in row.get("tags") or [] if t.startswith("arxiv:")}
+            if not (any(n in alnum(rid) for n in names) or cites == {"arxiv:" + arxiv_id}):
+                continue  # an artifact that merely cites the paper
+            by_owner = rid.split("/")[0].lower() in owners  # same owner as the paper's verified GitHub repo
+            prefix = {"models": "", "datasets": "datasets/", "spaces": "spaces/"}[kind]
+            found.append({"kind": kind[:-1], "id": rid, "likes": row.get("likes") or 0, "verified": by_owner,
+                          "url": "https://huggingface.co/%s%s" % (prefix, rid)})
+            break  # best (most liked) artifact of this kind
     found.sort(key=lambda a: -a["likes"])
     return found
 
@@ -1375,8 +1473,10 @@ def hf_paper(http: Http, arxiv_id: str) -> dict:
         return {}
 
 
-LIST_REPO_RE = re.compile(r"awesome|papers?\b|paper-?list|reading|survey|curated|collection|must-?read|resources|"
-                          r"tutorial|course|notes", re.I)
+# Paper lists, surveys and course notes, not implementations. Only the plural "papers": a paper's own repo is often
+# described as "Official implementation of the paper ...".
+LIST_REPO_RE = re.compile(r"awesome|\bpapers\b|paper[- ]?list|reading[- ]?list|survey|curated|collection|must-?read|"
+                          r"resources|tutorial|course|notes", re.I)
 
 
 def repo_title_overlap(item: dict, title: str) -> float:
@@ -1413,11 +1513,14 @@ def github_search(http: Http, title: str, token: str | None, arxiv_id: str | Non
         log("  GitHub search failed: %s" % err)
         return None
     name = alnum(short_name(title) or "")
+    phrase = " %s " % norm(short_name(title) or "")
     for item in (res or {}).get("items") or []:
         if LIST_REPO_RE.search("%s %s" % (item.get("name"), item.get("description") or "")):
             continue
         overlap = repo_title_overlap(item, title)
-        named = len(name) >= 3 and name in alnum(item.get("name"))
+        # The README has the exact title; the short name in the repo's name or description makes it the paper's repo
+        # (MiniGPT-v2 lives in Vision-CAIR/MiniGPT-4, "Open-sourced codes for MiniGPT-4 and MiniGPT-v2").
+        named = len(name) >= 3 and (name in alnum(item.get("name")) or phrase in " %s " % norm(item.get("description")))
         if overlap >= 0.6 or named:
             strong = named or repo_points_to_paper(item, title, arxiv_id)
             return {"repo": item["full_name"], "url": item["html_url"], "stars": item["stargazers_count"],
@@ -1444,7 +1547,9 @@ def github_name_search(http: Http, title: str, token: str, arxiv_id: str | None 
         desc_toks = set(keywords_from((item.get("description") or "") + " " + item.get("name", "")))
         overlap = len(title_toks & desc_toks) / max(1, len(title_toks))
         if alnum(name) in alnum(item.get("name")) and overlap >= 0.35:
-            strong = repo_points_to_paper(item, title, arxiv_id)
+            # The most-starred repo named exactly like the paper (SAM 2 -> facebookresearch/sam2) is its own; a longer
+            # name ("lora-finetune") needs the repo to point at the paper.
+            strong = alnum(item.get("name")) == alnum(name) or repo_points_to_paper(item, title, arxiv_id)
             return {"repo": item["full_name"], "url": item["html_url"], "stars": item["stargazers_count"],
                     "archived": item.get("archived", False), "pushed": (item.get("pushed_at") or "")[:10],
                     "description": (item.get("description") or "")[:200],
@@ -1452,11 +1557,14 @@ def github_name_search(http: Http, title: str, token: str, arxiv_id: str | None 
     return None
 
 
-def find_code(http: Http, papers: list, use_search: bool = True) -> None:
+def find_code(http: Http, papers: list, use_search: bool = True, with_hf: bool = True, with_docs: bool = True,
+              rest_budget: int = 55) -> None:
     """Adds p['code'] = {'github': [...], 'hf': [...]} to each paper dict (in place).
 
     Repo sources, most trusted first: the repo linked on the paper's Hugging Face page, links in the arXiv comment or
     abstract (which can also name a dependency, hence the order), then a GitHub name search flagged as unverified.
+    `with_hf` adds Hugging Face models / datasets / spaces; `with_docs` scores the first verified repo's README.
+    The cheap probe used before selection turns search, Hugging Face artifacts and READMEs off.
     """
     token = github_token()
     arxiv_ids = [(p.get("externalIds") or {}).get("ArXiv") for p in papers]
@@ -1482,7 +1590,7 @@ def find_code(http: Http, papers: list, use_search: bool = True) -> None:
                 best[repo.lower()] = (prio, repo)
         candidates[p.get("paperId") or p.get("title")] = sorted(best.values())[:3]
     all_repos = [r for repos in candidates.values() for _, r in repos]
-    info = github_repo_info(http, all_repos, token)
+    info = github_repo_info(http, all_repos, token, rest_budget=rest_budget)
     searches = 0
     for p, aid in zip(papers, arxiv_ids):
         ranked_gh = []
@@ -1490,7 +1598,7 @@ def find_code(http: Http, papers: list, use_search: bool = True) -> None:
             meta_r = info.get(r.lower())
             if not meta_r and r.lower() in hf_stars:  # GitHub not queried (no token / quota): use HF's star count
                 meta_r = {"repo": r, "url": "https://github.com/" + r, "stars": hf_stars[r.lower()], "archived": False,
-                          "pushed": "", "description": None}
+                          "pushed": "", "created": "", "description": None}
             if meta_r and r.lower() in hf_auto and meta_r.get("description") is not None:
                 name = alnum(short_name(p.get("title") or "") or "")
                 if repo_title_overlap(meta_r, p.get("title") or "") < 0.34 and not (len(name) >= 3 and name in alnum(r)):
@@ -1504,9 +1612,11 @@ def find_code(http: Http, papers: list, use_search: bool = True) -> None:
             searches += 1
             if hit:
                 gh.append(hit)
-        owners = {g["repo"].split("/")[0].lower() for g in gh if "verify" not in (g.get("source") or "")}
-        hf = hf_artifacts(http, aid, p.get("title") or "", owners) if aid else []
+        verified = [g["repo"] for g in gh if "verify" not in (g.get("source") or "")]
+        hf = hf_artifacts(http, aid, p.get("title") or "", verified) if aid and with_hf else []
         p["code"] = {"github": gh[:2], "hf": hf[:2]}
+    if with_docs:
+        add_docs(http, papers, token)
 
 
 # ----------------------------------------------------------------------------- OpenAlex (optional)
@@ -1554,11 +1664,14 @@ class OpenAlex:
                     return loc["work_id"].rsplit("/", 1)[-1]
         return None
 
-    def top_citers(self, work: str, min_cites: int = 0) -> list:
-        """The 100 most-cited works citing `work` (per_page above 100 is deprecated)."""
-        res = self._get("works", filter="cites:%s,cited_by_count:>%d" % (work, max(min_cites - 1, 0)),
-                        sort="cited_by_count:desc", select="id,display_name,publication_year,cited_by_count,doi,ids",
-                        per_page=100)
+    def top_citers(self, work: str, min_cites: int = 0, since: str | None = None) -> list:
+        """The 100 most-cited works citing `work`, optionally only those published on or after `since` (YYYY-MM-DD).
+        per_page above 100 is deprecated."""
+        flt = "cites:%s,cited_by_count:>%d" % (work, max(min_cites - 1, 0))
+        if since:
+            flt += ",from_publication_date:%s" % since
+        res = self._get("works", filter=flt, sort="cited_by_count:desc",
+                        select="id,display_name,publication_year,cited_by_count,doi,ids", per_page=100)
         return (res or {}).get("results") or []
 
     @staticmethod
@@ -1577,12 +1690,28 @@ class OpenAlex:
 
 # ----------------------------------------------------------------------------- stages
 
-def workdir_for(args, seed_title: str | None = None) -> str:
+def workdir_for(args, seed_title: str | None = None, n_seeds: int = 1) -> str:
     if getattr(args, "workdir", None):
         return args.workdir
     if seed_title:
-        return os.path.abspath("fbsearch-" + slugify(seed_title))
+        more = "-and-%d-more" % (n_seeds - 1) if n_seeds > 1 else ""
+        return os.path.abspath("fbsearch-" + slugify(seed_title) + more)
     raise SystemExit("--workdir is required (use the folder printed by `backward`).")
+
+
+def load_seeds(wd: str) -> list:
+    seeds = load_json(os.path.join(wd, "seeds.json"))
+    if seeds:
+        return seeds
+    if os.path.exists(os.path.join(wd, "seed.json")):
+        raise SystemExit("%s was made by citation-snowball 1.2 or earlier; re-run `backward` (1.3 keeps one folder per "
+                         "seed)." % wd)
+    raise SystemExit("No seeds.json in %s - run `backward` first." % wd)
+
+
+def hub_cutoff(seeds: list) -> int:
+    """Core papers cited at least this often are hubs (see HUB_MIN_CITATIONS)."""
+    return max(HUB_MIN_CITATIONS, 10 * max([s.get("citationCount") or 0 for s in seeds] or [0]))
 
 
 def cmd_resolve(args) -> None:
@@ -1593,24 +1722,54 @@ def cmd_resolve(args) -> None:
 
 def cmd_backward(args) -> None:
     http = Http(args.cache_dir, refresh=args.refresh)
-    seed = resolve(http, args.seed)
-    wd = workdir_for(args, seed.get("title"))
+    resolved = []
+    for raw in args.seed:
+        paper = resolve(http, raw)
+        if paper["paperId"] not in {p["paperId"] for p in resolved}:
+            resolved.append(paper)
+    wd = workdir_for(args, resolved[0].get("title"), len(resolved))
     os.makedirs(wd, exist_ok=True)
+    # Seeds already in the workdir stay; running `backward` on one of them again (e.g. with --type) replaces it.
+    seeds = load_json(os.path.join(wd, "seeds.json"), []) or []
+    summaries = []
+    for paper in resolved:
+        entry, lines = backward_one(http, args, wd, paper)
+        idx = next((i for i, s in enumerate(seeds) if s["paperId"] == entry["paperId"]), None)
+        if idx is None:
+            seeds.append(entry)
+        else:
+            seeds[idx] = entry
+        summaries.append(lines)
+    for s in seeds:  # a seed that cites another seed: that one is a seed, not part of the comparison set
+        refs = load_json(os.path.join(wd, s["dir"], "refs.json"), []) or []
+        cited = {(e.get("citedPaper") or {}).get("paperId") for e in refs}
+        s["cites_seeds"] = sorted(o["key"] for o in seeds if o["paperId"] in cited and o["paperId"] != s["paperId"])
+    save_json(os.path.join(wd, "seeds.json"), seeds)
+    core = merge_cores(wd, seeds, args.max_core)
+    save_json(os.path.join(wd, "core.json"), core)
+    print_backward_summary(wd, seeds, summaries, core, http)
+
+
+def backward_one(http: Http, args, wd: str, seed: dict) -> tuple:
+    """The backward stage for one seed, written to <wd>/seeds/<key>/. -> (seeds.json entry, summary lines)."""
+    key = short_id(seed["paperId"])
+    sd = os.path.join(wd, "seeds", key)
+    os.makedirs(sd, exist_ok=True)
     ptype = args.type or guess_type(seed.get("title"), seed.get("abstract"))
     seed["paper_type"] = ptype
     seed["paper_type_source"] = "user/agent" if args.type else "auto-guess"
-    save_json(os.path.join(wd, "seed.json"), seed)
+    save_json(os.path.join(sd, "seed.json"), seed)
     log("Seed: %s (%s) [%s] cites=%s" % (seed.get("title"), seed.get("year"), seed.get("paperId"), seed.get("citationCount")))
 
     log("Fetching references ...")
     refs = [e for e in s2_edges(http, seed["paperId"], "references", REF_FIELDS, cap=5000)
             if (e.get("citedPaper") or {}).get("title")]
     log("Fetching full text ...")
-    src, html_text, plain, pdf = fetch_fulltext(http, seed, wd)
+    src, html_text, plain, pdf = fetch_fulltext(http, seed, sd)
     digest, recovered = None, 0
     if html_text:
         digest = digest_html(html_text)
-        with open(os.path.join(wd, "fulltext.txt"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(sd, "fulltext.txt"), "w", encoding="utf-8") as fh:
             fh.write(digest.pop("fulltext"))
         digest["source"] = src
         n_bib = len(digest["bib"])
@@ -1624,7 +1783,7 @@ def cmd_backward(args) -> None:
             refs, recovered = refs + new, len(new)
             if new:
                 log("  recovered %d references from the bibliography" % recovered)
-        save_json(os.path.join(wd, "digest.json"), digest)
+        save_json(os.path.join(sd, "digest.json"), digest)
     elif plain:
         log("  No arXiv HTML; wrote fulltext.txt from the PDF (no table/section structure).")
     elif pdf:
@@ -1635,12 +1794,74 @@ def cmd_backward(args) -> None:
     if not refs:
         log("  No references from Semantic Scholar or the bibliography. Trying Crossref ...")
         refs = crossref_refs(http, seed)
-    save_json(os.path.join(wd, "refs.json"), refs)
+    save_json(os.path.join(sd, "refs.json"), refs)
+    core = propose_core(refs, digest, ptype, {"max_core": args.max_core},
+                        "%s %s" % (seed.get("title") or "", seed.get("abstract") or ""))
+    save_json(os.path.join(sd, "core.json"), core)
 
-    cfg = {"max_core": args.max_core}
-    core = propose_core(refs, digest, ptype, cfg, "%s %s" % (seed.get("title") or "", seed.get("abstract") or ""))
-    save_json(os.path.join(wd, "core.json"), core)
-    print_backward_summary(wd, seed, digest, core, refs, recovered, pdf if not html_text else None, http)
+    entry = {"key": key, "paperId": seed["paperId"], "title": seed.get("title"), "year": seed.get("year"),
+             "venue": seed.get("venue"), "publicationDate": seed.get("publicationDate"),
+             "citationCount": seed.get("citationCount"), "externalIds": seed.get("externalIds") or {},
+             "authors": (seed.get("authors") or [])[:6], "paper_type": ptype,
+             "paper_type_source": seed["paper_type_source"], "dir": os.path.join("seeds", key)}
+    lines = ["SEED    %s (%s, %s) cites=%s  key=%s  type=%s (%s)" % (
+                 seed.get("title"), seed.get("venue") or "-", seed.get("year"), seed.get("citationCount"), key, ptype,
+                 seed["paper_type_source"]),
+             "  refs  %d references (%d recovered from the bibliography)" % (len(refs), recovered)]
+    if digest:
+        mapped = sum(1 for b in digest["bib"].values() if "ref" in b)
+        lines.append("  text  %s | %d sections, %d tables, %d bib entries (%d matched to references)"
+                     % (digest["source"], len(digest["sections"]), len(digest["tables"]), len(digest["bib"]), mapped))
+        for t in digest["tables"]:
+            if t["bib"]:
+                lines.append("  table %-8s [%s] cites %d refs | %s" % (t["id"], t["kind"], len(t["bib"]), t["caption"][:100]))
+    elif pdf:
+        lines.append("  PDF   %s (no HTML version: table positions unknown, roles come from citation contexts only)" % pdf)
+    if os.path.exists(os.path.join(sd, "fulltext.txt")):
+        lines.append("  read  %s" % os.path.join(sd, "fulltext.txt"))
+    return entry, lines
+
+
+ROLE_ORDER = {"baseline": 0, "benchmarked_model": 1, "compared_dataset": 2, "compared_benchmark": 3, "related": 4,
+              "eval_dataset": 5, "background": 6}
+
+
+def merge_cores(wd: str, seeds: list, max_core: int) -> list:
+    """Merge the per-seed core proposals into one core set: a reference compared by any seed is included, with its
+    strongest role, and `seeds` lists the seeds that cite it. Papers that are themselves seeds are left out."""
+    seed_ids = {s["paperId"] for s in seeds}
+    multi = len(seeds) > 1
+    merged, order = {}, []
+    for s in seeds:
+        tag = label(s.get("title"), 24)
+        for row in load_json(os.path.join(wd, s["dir"], "core.json"), []) or []:
+            pid = row.get("paperId")
+            if pid in seed_ids:
+                continue
+            evidence = [("[%s] %s" % (tag, e)) if multi else e for e in row.get("evidence") or []]
+            key = pid or "%s@%s" % (row["id"], s["key"])
+            cur = merged.get(key)
+            if cur is None:
+                cur = merged[key] = dict(row, evidence=evidence, seeds=[s["key"]])
+                if not pid and multi:
+                    cur["id"] = "%s@%s" % (row["id"], s["key"][:4])  # "ref12" is only unique within one seed
+                order.append(key)
+                continue
+            cur["seeds"].append(s["key"])
+            cur["evidence"] += evidence
+            cur["include"] = bool(cur.get("include") or row.get("include"))
+            if ROLE_ORDER.get(row["role"], 9) < ROLE_ORDER.get(cur["role"], 9):
+                cur["role"] = row["role"]
+            cur["score"] = max(cur.get("score") or 0, row.get("score") or 0)
+            cur["overlap"] = max(cur.get("overlap") or 0, row.get("overlap") or 0)
+    rows = [merged[k] for k in order]
+    included = [r for r in rows if r.get("include")]
+    if multi and len(included) > max_core:  # papers compared by several seeds first
+        included.sort(key=lambda r: (r["role"] not in TABLE_ROLES, -len(r["seeds"]), -(r.get("score") or 0)))
+        for row in included[max_core:]:
+            row["include"] = False
+    rows.sort(key=lambda r: (not r.get("include"), ROLE_ORDER.get(r["role"], 9), -len(r["seeds"]), -(r.get("score") or 0)))
+    return rows
 
 
 def crossref_refs(http: Http, seed: dict) -> list:
@@ -1659,20 +1880,21 @@ def crossref_refs(http: Http, seed: dict) -> list:
             for p in found.values()]
 
 
-def print_backward_summary(wd, seed, digest, core, refs, recovered, pdf, http) -> None:
-    out = ["WORKDIR %s" % wd,
-           "SEED    %s (%s, %s) cites=%s  type=%s (%s)" % (seed.get("title"), seed.get("venue") or "-", seed.get("year"),
-                                                         seed.get("citationCount"), seed["paper_type"], seed["paper_type_source"]),
-           "REFS    %d references (%d recovered from the bibliography)" % (len(refs), recovered)]
-    if digest:
-        mapped = sum(1 for b in digest["bib"].values() if "ref" in b)
-        out.append("DIGEST  %s | %d sections, %d tables, %d bib entries (%d matched to references)"
-                   % (digest["source"], len(digest["sections"]), len(digest["tables"]), len(digest["bib"]), mapped))
-        for t in digest["tables"]:
-            if t["bib"]:
-                out.append("  table %-8s [%s] cites %d refs | %s" % (t["id"], t["kind"], len(t["bib"]), t["caption"][:110]))
-    elif pdf:
-        out.append("PDF     %s (no HTML version: table positions unknown, roles come from citation contexts only)" % pdf)
+def core_line(row: dict, multi: bool) -> str:
+    return "  %-4s %-9s %-18s %7s  %-5s %s%s | %s" % (
+        "y" if row.get("include") else "-", row["id"], row["role"], row["citationCount"], row.get("year") or "",
+        ("[%d seeds] " % len(row.get("seeds") or []) if multi and len(row.get("seeds") or []) > 1 else ""),
+        (row["title"] or "")[:70], "; ".join(row.get("evidence") or [])[:150])
+
+
+def print_backward_summary(wd: str, seeds: list, summaries: list, core: list, http: Http) -> None:
+    multi = len(seeds) > 1
+    out = ["WORKDIR %s" % wd]
+    for lines in summaries:
+        out += lines
+    if multi:
+        out.append("SEEDS   %d in this workdir: %s" % (len(seeds), "; ".join("%s (%s)" % (label(s["title"], 40), s["key"])
+                                                                          for s in seeds)))
     if http.s2_busy:
         out.append("NOTE    %d retries against Semantic Scholar's busy keyless pool; an S2_API_KEY makes runs much faster."
                    % http.s2_busy)
@@ -1680,31 +1902,30 @@ def print_backward_summary(wd, seed, digest, core, refs, recovered, pdf, http) -
         out.append("WARNING requests failed even after retries (%s); re-run `backward` when the network is stable."
                    % ", ".join("%s x%d" % kv for kv in sorted(http.failures.items(), key=lambda kv: -kv[1])))
     out.append("")
-    out.append("PROPOSED CORE SET (include=y feeds the forward search; edit core.json to change)")
+    out.append("PROPOSED CORE SET (include=y feeds the search; table roles are listed in full in the report's section A)")
     out.append("  inc  id        role               cites   year  title  | evidence")
     shown = 0
     for row in core:
-        if row["role"] == "background" and not row["include"]:
+        if row["role"] == "background" and not row.get("include"):
             continue
-        if not row["include"]:
+        if not row.get("include"):
             shown += 1
             if shown > 25:
                 continue
-        out.append("  %-4s %-9s %-18s %7s  %-5s %s | %s" % (
-            "y" if row["include"] else "-", row["id"], row["role"], row["citationCount"], row["year"] or "",
-            (row["title"] or "")[:70], "; ".join(row["evidence"])[:150]))
-    hidden = sum(1 for r in core if r["role"] == "background" and not r["include"]) + max(0, shown - 25)
+        out.append(core_line(row, multi))
+    hidden = sum(1 for r in core if r["role"] == "background" and not r.get("include")) + max(0, shown - 25)
     out.append("  (+%d more references not shown, mostly background; see core.json)" % hidden)
     print("\n".join(out))
 
 
 def cmd_core(args) -> None:
-    """Show the core set, or change it: --include/--exclude ids, --role id=role."""
+    """Show the core set, or change it: --include/--exclude ids, --role id=role, --add a missing paper."""
     wd = workdir_for(args)
     path = os.path.join(wd, "core.json")
     core = load_json(path)
     if core is None:
         raise SystemExit("No core.json in %s - run `backward` first." % wd)
+    multi = len(load_json(os.path.join(wd, "seeds.json"), []) or []) > 1
     by_id = {}
     for row in core:
         by_id.setdefault(row["id"], row)
@@ -1735,7 +1956,7 @@ def cmd_core(args) -> None:
             row = {"id": short_id(paper["paperId"]), "paperId": paper["paperId"], "title": paper.get("title"),
                    "year": paper.get("year"), "venue": paper.get("venue"), "citationCount": paper.get("citationCount") or 0,
                    "publicationDate": paper.get("publicationDate"), "externalIds": paper.get("externalIds") or {},
-                   "role": role, "score": 0, "overlap": 0, "evidence": ["added by hand"], "include": True}
+                   "role": role, "score": 0, "overlap": 0, "evidence": ["added by hand"], "include": True, "seeds": []}
             core.insert(0, row)
             by_id[row["id"]] = by_id[row["paperId"]] = row
         row.update(include=True, excluded=False, role=role)
@@ -1748,7 +1969,7 @@ def cmd_core(args) -> None:
         changed.append("+" + row["id"])
     for ident in filter(None, (args.exclude or "").split(",")):
         row = find(ident)
-        row["include"], row["excluded"] = False, True  # also keeps it out of the report's backward list
+        row["include"], row["excluded"] = False, True  # also keeps it out of every section of the report
         changed.append("-" + row["id"])
     for spec in args.role or []:
         ident, _, role = spec.partition("=")
@@ -1760,277 +1981,140 @@ def cmd_core(args) -> None:
         save_json(path, core)
         print("UPDATED %s" % " ".join(changed))
     inc = [r for r in core if r.get("include")]
-    print("CORE    %d papers feed the forward search" % len(inc))
-    rows = inc if not args.all else core
-    for row in rows:
-        print("  %-4s %-9s %-18s %7s  %-5s %s | %s" % (
-            "y" if row.get("include") else "-", row["id"], row["role"], row["citationCount"], row.get("year") or "",
-            (row["title"] or "")[:70], "; ".join(row.get("evidence") or [])[:120]))
+    print("CORE    %d papers feed the search; %d of them are compared in tables (listed in full in section A)"
+          % (len(inc), sum(1 for r in inc if r["role"] in TABLE_ROLES)))
+    for row in (inc if not args.all else core):
+        print(core_line(row, multi))
 
 
-def cmd_forward(args) -> None:
-    wd = workdir_for(args)
-    seed = load_json(os.path.join(wd, "seed.json"))
-    core = load_json(os.path.join(wd, "core.json"), [])
-    if not seed:
-        raise SystemExit("No seed.json in %s - run `backward` first." % wd)
-    http = Http(args.cache_dir, refresh=args.refresh)
-    today = dt.date.today()
-    keyed = bool(s2_key())
-    seed_cap = args.seed_cap or (9999 if keyed else 3000)
-    core_cap = args.cap or (3000 if keyed else 1000)
-    cfg = {"min_citations": args.min_citations, "recent_months": args.recent_months,
-           "recent_min_citations": args.recent_min_citations}
-    floor = min(cfg["min_citations"], cfg["recent_min_citations"])
-    keywords = [k.strip().lower() for k in (args.keywords or "").split(",") if k.strip()]
-    query = args.query or (" | ".join(('"%s"' % k) if " " in k else k for k in keywords) if keywords else None)
-    if not keywords:
-        keywords = keywords_from(seed.get("title") or "")
-    included = [c for c in core if c.get("include") and c.get("paperId")]
-    core_ids = {c["paperId"] for c in included}
-    # Hubs (ViT, CLIP, GPT-3, or SAM for a SAM-variant seed) are cited by nearly every paper in the area, so citing
-    # one says little about relevance: half weight. "Hub" is relative to the seed's own citation count.
-    hub_cut = max(HUB_MIN_CITATIONS, 10 * (seed.get("citationCount") or 0))
-    weight = {c["paperId"]: (0.5 if (c.get("citationCount") or 0) >= hub_cut else 1.0) for c in included}
-    seed_id = seed["paperId"]
-    excluded_ids = {c["paperId"] for c in core if c.get("excluded") and c.get("paperId")}
-    log("Forward search over the seed + %d core papers (newest %d citers each, %d for the seed) ..."
-        % (len(included), core_cap, seed_cap))
+# ----------------------------------------------------------------------------- selection (pure: no network)
 
-    pool = {}  # paperId -> candidate record
+SELECT_DEFAULTS = {"min_forward": 8, "max_follow_ups": 15, "max_foundations": 6, "max_latest": 8, "max_also": 20,
+                   "expand": "auto", "min_citations": 0, "min_docs": 4, "recent_months": 12, "mid_months": 24,
+                   "latest_months": 30, "min_coupling": 1, "min_area": 30}
 
-    def add(paper: dict, source: str, cited: str | None = None, influential: bool = False):
-        pid = paper.get("paperId")
-        if not pid or pid == seed_id or pid in excluded_ids:  # excluded with `core --exclude`: keep out entirely
-            return None
-        rec = pool.get(pid)
-        if rec is None:
-            rec = pool[pid] = {"paper": dict(paper), "sources": set(), "cited": set(), "influential": 0,
-                               "backward_role": None, "evidence": [], "core_included": False, "verified": False}
-        else:
-            for k, v in paper.items():
-                old = rec["paper"].get(k)
-                if v is not None and (old is None or (k == "citationCount" and v > (old or 0))):
-                    rec["paper"][k] = v
-        rec["sources"].add(source)
-        if cited and cited != pid:  # Semantic Scholar occasionally lists a paper among its own citers
-            rec["cited"].add(cited)
-        rec["influential"] += int(bool(influential))
-        return rec
 
-    oa = OpenAlex(http, args.openalex_budget) if args.openalex_budget > 0 else None
-    oa_wanted = {}  # Semantic Scholar id -> (OpenAlex title, set of cited paperIds)
+def selection_config(args, base: dict | None = None) -> dict:
+    """Gates and caps from the command line, on top of `base` (the settings `forward` saved) or the defaults."""
+    base = base or {}
+    cfg = {k: base.get(k, v) for k, v in SELECT_DEFAULTS.items()}
+    for k in SELECT_DEFAULTS:
+        if getattr(args, k, None) is not None:
+            cfg[k] = getattr(args, k)
+    gates = {k: tuple(v) for k, v in (base.get("gates") or GATES).items()}
+    if getattr(args, "max_forward", None) is not None:  # 1.2 flag
+        log("  --max-forward is deprecated; it now sets --max-follow-ups.")
+        cfg["max_follow_ups"] = args.max_forward
+    if getattr(args, "max_backward", None) is not None:
+        log("  --max-backward is ignored: section A1 lists every paper compared in the seed's tables "
+            "(drop one with `core --exclude`).")
+    if getattr(args, "recent_min_citations", None) is not None:
+        log("  --recent-min-citations is deprecated; it now sets --gate seed.recent=%d." % args.recent_min_citations)
+        gates["seed.recent"] = (args.recent_min_citations, gates["seed.recent"][1])
+    for spec in getattr(args, "gate", None) or []:
+        name, _, value = spec.partition("=")
+        name = name.strip()
+        if name not in GATES:
+            raise SystemExit("Unknown gate %r; use one of: %s" % (name, ", ".join(GATES)))
+        parts = [x.strip() for x in value.split(",")]
+        try:
+            cites = None if parts[0] in ("-", "none") else int(parts[0])
+            stars = gates[name][1] if len(parts) < 2 else (None if parts[1] in ("", "-", "none") else int(parts[1]))
+        except ValueError:
+            raise SystemExit("--gate %s: use ROUTE.BRACKET=CITES or CITES,STARS (e.g. seed.recent=10,100; "
+                             "'-' closes the bracket or its stars route, e.g. expand.mid=40,-)" % spec)
+        gates[name] = (cites, stars)
+    cfg["gates"] = gates
+    return cfg
 
-    def queue_openalex(paper: dict) -> None:
-        wid = oa.work_id(paper)
-        for w in (oa.top_citers(wid, min_cites=floor) if wid else []):
-            for sid in OpenAlex.s2_ids(w):
-                oa_wanted.setdefault(sid, (w.get("display_name"), set()))[1].add(paper["paperId"])
 
-    # 1. Citers of the seed (complete unless it has more than seed_cap).
-    edges = s2_edges(http, seed_id, "citations", CIT_FIELDS, cap=seed_cap)
-    for e in edges:
-        add(e.get("citingPaper") or {}, "seed-citers", seed_id, e.get("isInfluential"))
-    log("  seed: %d citing papers%s" % (len(edges), " (newest only)" if (seed.get("citationCount") or 0) > len(edges) else ""))
-    if oa and (seed.get("citationCount") or 0) > len(edges):
-        queue_openalex(seed)
-    n_seed_citers = len(edges)
+def months_since(date: str | None, today: dt.date) -> int | None:
+    return months_old({"publicationDate": date}, today) if date else None
 
-    # 2. Newest citers of each core paper. Older influential citers come from steps 3 and 4.
-    for c in included:
-        edges = s2_edges(http, c["paperId"], "citations", CIT_FIELDS, cap=core_cap)
-        for e in edges:
-            add(e.get("citingPaper") or {}, "core-citers", c["paperId"], e.get("isInfluential"))
-        partial = (c.get("citationCount") or 0) > len(edges)
-        if oa and partial:
-            queue_openalex(c)
-        log("  %-60s %6d citers%s" % ((c["title"] or "")[:60], len(edges), " (newest only)" if partial else ""))
 
-    # 3. Citation-sorted topic search: influential papers on the seed's topic, however old.
-    n_topic = 0
-    if query and not args.no_topic_search:
-        hits = s2_bulk_search(http, query, min_citations=floor, limit=args.topic_limit)
-        for p in hits:
-            add(p, "topic-search")
-        n_topic = len(hits)
-        log("  topic search %s: %d papers with at least %d citations" % (query, n_topic, floor))
-    elif not query:
-        log("  No --query/--keywords given, so no topic search: older influential citers of heavily cited core papers "
-            "can be missed.")
+def bracket_of(age: int | None, cfg: dict) -> str:
+    if age is None or age > cfg["mid_months"]:
+        return "old"
+    return "recent" if age <= cfg["recent_months"] else "mid"
 
-    # 4. OpenAlex's most-cited citers of partially fetched papers, re-resolved in Semantic Scholar.
-    if oa_wanted:
-        found = s2_batch(http, list(oa_wanted), fields=PAPER_FIELDS)
-        matched = 0
-        for sid, p in found.items():
-            title, cited_ids = oa_wanted[sid]
-            if title_close(p.get("title"), title):  # drops OpenAlex mis-merges
-                for cid in cited_ids:
-                    add(p, "openalex", cid)
-                matched += 1
-        log("  OpenAlex: %d most-cited citers matched in Semantic Scholar (%d billable OpenAlex calls)" % (matched, oa.used))
 
-    # 5. The backward side: the core set plus other compared / related references.
-    for c in core:
-        relevant_role = c["role"] in CORE_ROLES and (c["role"] != "related" or (c.get("overlap") or 0) >= 0.2)
-        if c.get("paperId") and (c.get("include") or (relevant_role and not c.get("excluded"))):
-            rec = add({k: c.get(k) for k in ("paperId", "title", "year", "venue", "citationCount", "externalIds",
-                                             "publicationDate")}, "backward")
-            if rec:
-                rec["backward_role"] = c["role"]
-                rec["evidence"] = c.get("evidence") or []
-                rec["core_included"] = bool(c.get("include"))
+def best_repo(p: dict) -> dict | None:
+    """The first verified GitHub repo found for a paper (by the probe or the full code lookup)."""
+    for g in (p.get("code") or {}).get("github") or []:
+        if "verify" not in (g.get("source") or ""):
+            return g
+    return None
 
-    # 6. Verify which of the seed + core papers each candidate above the threshold really cites.
-    targets = core_ids | {seed_id}
-    to_verify = [pid for pid, rec in pool.items() if not rec["backward_role"] and passes_threshold(rec["paper"], cfg, today)]
-    to_verify.sort(key=lambda pid: -(pool[pid]["paper"].get("citationCount") or 0))
-    to_verify = to_verify[:args.verify_cap]
-    log("Checking the reference lists of %d candidates above the citation threshold ..." % len(to_verify))
-    # Candidates with no observed citation edge (topic search / OpenAlex hits) depend entirely on this check.
-    reflists = s2_reference_ids(http, to_verify, deep={pid for pid in to_verify if not pool[pid]["cited"]})
-    no_reflist = 0
-    for pid in to_verify:
-        refs = reflists.get(pid)
-        if refs is None:
-            no_reflist += 1
+
+def gate(p: dict, route: str, cfg: dict, today: dt.date, core_score: float = 0.0) -> str | None:
+    """A short reason when the paper passes its route's influence gate (see GATES), else None.
+
+    route "seed" (B): the "any" bracket, then the paper's age bracket. route "expand" (C): the age bracket only, and
+    papers older than the mid bracket also need citations of at least 2 core papers. --min-citations is a hard floor
+    that also turns the stars routes off.
+    """
+    cites = p.get("citationCount") or 0
+    floor = cfg.get("min_citations") or 0
+    if cites < floor:
+        return None
+    age = months_old(p, today)
+    bracket = bracket_of(age, cfg)
+    names = ["seed.any", "seed." + bracket] if route == "seed" else ["expand." + bracket]
+    repo = best_repo(p)
+    for name in names:
+        if name not in cfg["gates"]:
             continue
-        pool[pid]["cited"] |= refs & targets
-        pool[pid]["verified"] = True
-
-    # 7. Relevance tiers, threshold, size caps.
-    kw_phrases = [norm(k) for k in keywords if norm(k)]
-    selected_b, selected_f, below = [], [], []
-    for pid, rec in pool.items():
-        p = rec["paper"]
-        ok = passes_threshold(p, cfg, today)
-        title_n = " %s " % norm(p.get("title"))
-        rec["keyword_hits"] = [k for k in kw_phrases if (" %s " % k) in title_n]
-        rec["cites_seed"] = seed_id in rec["cited"]
-        rec["n_core"] = len(rec["cited"] & core_ids)
-        core_score = sum(weight[c] for c in rec["cited"] & core_ids)
-        if rec["backward_role"]:
-            rec["tier"] = 0 if rec["core_included"] else 3
-            if ok:
-                selected_b.append(rec)
-            elif rec["core_included"]:
-                below.append(rec)
+        min_cites, min_stars = cfg["gates"][name]
+        if min_cites is None or (name == "expand.old" and core_score < 2):
+            continue  # closed bracket
+        if cites >= min_cites:
+            return "%s citations" % human(cites) + (" in %d months" % max(age, 1) if age is not None and age <= cfg["mid_months"] else "")
+        if not min_stars or not repo or floor:
             continue
-        topical = bool(rec["keyword_hits"]) or "topic-search" in rec["sources"]
-        if not (rec["cites_seed"] or core_score >= 2 or (rec["n_core"] >= 1 and (topical or rec["influential"]))):
-            continue
-        # Co-citation alone can come from a neighbouring field citing the same famous papers; topic match confirms it.
-        # Core hits are capped at 4 so a paper that lists every classic baseline cannot outrank an influential one.
-        rel = (1.5 * rec["cites_seed"] + min(core_score, 4.0) * (1.0 if topical else 0.6) + 0.5 * topical
-               + 0.5 * bool(rec["influential"]))
-        rec["survey"] = bool(SURVEY_RE.search(p.get("title") or "")) or "Review" in (p.get("publicationTypes") or [])
-        if rec["survey"]:
-            rel = min(rel, 2.5)  # surveys cite everything; keep them, but below focused work
-        rec["relevance"] = round(rel, 2)
-        rec["rank"] = rel + math.log10(1 + (p.get("citationCount") or 0))  # relevance, then influence
-        rec["tier"] = 1 if rel >= 3.5 else (2 if rel >= 2 else 3)
-        if ok:
-            selected_f.append(rec)
-
-    selected_b.sort(key=lambda r: (r["tier"], -(r["n_core"] + r["cites_seed"]), -(r["paper"].get("citationCount") or 0)))
-    selected_f.sort(key=lambda r: -r["rank"])
-    selected_b = dedupe_titles(selected_b)
-    selected_f = dedupe_titles(selected_f, against=selected_b + below)
-    role_of = {c["paperId"]: c["role"] for c in included}
-    for rec in selected_f:
-        rec["lineage"] = lineage_of(rec, role_of, weight)
-    picked_f = balanced_pick(selected_f, args.max_forward)
-    picked_ids = {id(r) for r in picked_f}
-    overflow = selected_b[args.max_backward:] + [r for r in selected_f if id(r) not in picked_ids]
-    chosen = selected_b[:args.max_backward] + picked_f
-    log("Selected %d backward + %d forward papers (%d overflow, %d directly compared but below threshold)"
-        % (min(len(selected_b), args.max_backward), min(len(selected_f), args.max_forward), len(overflow), len(below)))
-
-    details = s2_batch(http, [r["paper"]["paperId"] for r in chosen + below])
-    for rec in chosen + below:
-        d = details.get(rec["paper"]["paperId"])
-        if d:
-            rec["paper"] = d
-    if not args.no_code:
-        log("Looking up code (Hugging Face, arXiv, GitHub) ...")
-        find_code(http, [r["paper"] for r in chosen + below], use_search=not args.no_github_search)
-
-    title_of = {c["paperId"]: c["title"] for c in included}
-    seed_ref_role = {c["paperId"]: c["role"] for c in core if c.get("paperId")}  # everything the seed cites
-    chosen_ids = {id(r) for r in chosen}
-    below_ids = {id(r) for r in below}
-    out = []
-    for rec in chosen + below + overflow:
-        p = rec["paper"]
-        relation = []
-        ref_role = None if rec["backward_role"] else seed_ref_role.get(p.get("paperId"))
-        if rec["backward_role"]:
-            relation.append(ROLE_LABEL.get(rec["backward_role"], rec["backward_role"]))
-        elif ref_role:  # found by the forward search, but the seed cites it too
-            relation.append("cited by seed (%s)" % ROLE_LABEL.get(ref_role, ref_role))
-        if rec["cites_seed"]:
-            relation.append("cites seed")
-        core_titles = [label(title_of[h]) for h in rec["cited"] if h in title_of]
-        if core_titles:
-            relation.append("cites %d core: %s" % (len(core_titles), ", ".join(sorted(core_titles)[:4])
-                                                    + ("…" if len(core_titles) > 4 else "")))
-        if not relation:
-            relation.append("topic search")
-        if rec.get("survey"):
-            relation.append("survey")
-        out.append({
-            "key": short_id(p.get("paperId")), "paperId": p.get("paperId"), "title": p.get("title"),
-            "year": p.get("year"), "venue": p.get("venue"), "publicationDate": p.get("publicationDate"),
-            "citationCount": p.get("citationCount"), "influentialCitationCount": p.get("influentialCitationCount"),
-            "externalIds": p.get("externalIds"), "authors": [a.get("name") for a in (p.get("authors") or [])][:6],
-            "tldr": ((p.get("tldr") or {}).get("text") if isinstance(p.get("tldr"), dict) else None),
-            "abstract": p.get("abstract"), "publicationTypes": p.get("publicationTypes"),
-            "direction": "backward" if (rec["backward_role"] or ref_role) else "forward",
-            "role": rec["backward_role"], "tier": rec.get("tier"), "relation": "; ".join(relation),
-            "cites_seed": rec["cites_seed"], "n_core": rec["n_core"], "relevance": rec.get("relevance"),
-            "rank": round(rec["rank"], 2) if rec.get("rank") is not None else None,
-            "lineage": rec.get("lineage"),
-            "found_via": sorted(rec["sources"]),
-            "verified": rec["verified"], "evidence": rec.get("evidence") or [], "code": p.get("code"),
-            "link": paper_link(p),
-            "bucket": "main" if id(rec) in chosen_ids else ("below_threshold" if id(rec) in below_ids else "overflow"),
-        })
-    meta = {"generated": today.isoformat(), "thresholds": cfg, "keywords": keywords, "query": query,
-            "seed_cap": seed_cap, "cap": core_cap, "seed_citers": n_seed_citers, "core_used": len(included),
-            "topic_hits": n_topic, "pool": len(pool), "verified": len(to_verify) - no_reflist,
-            "no_reference_list": no_reflist, "openalex_calls": oa.used if oa else 0,
-            "s2_busy_retries": http.s2_busy, "failures": http.failures, "http_calls": http.counts}
-    save_json(os.path.join(wd, "candidates.json"), {"meta": meta, "papers": out})
-    write_briefs(wd, seed, out)
-    print_forward_summary(wd, out, meta)
+        stars, docs = repo.get("stars") or 0, repo.get("docs")
+        if docs is None and stars >= 2 * min_stars:
+            return "★%s (README not checked)" % human(stars)
+        if docs is not None and stars >= min_stars and docs >= cfg["min_docs"]:
+            return "★%s, docs %d/5" % (human(stars), docs)
+    return None
 
 
-def lineage_of(rec: dict, role_of: dict, weight: dict) -> str:
-    """Which part of the comparison set connects a forward paper: 'seed', a core role, or 'topic'."""
-    if rec["cites_seed"]:
-        return "seed"
-    score = {}
-    for pid in rec["cited"]:
-        if pid in role_of:
-            score[role_of[pid]] = score.get(role_of[pid], 0) + weight.get(pid, 1.0)
-    return max(sorted(score), key=lambda r: score[r]) if score else "topic"
+def sota_score(p: dict, today: dt.date, cfg: dict) -> float:
+    """Ranking within section B: citations per month plus half the GitHub stars per month (log scale), +0.5 for
+    papers from the last `recent_months`, -0.5 for surveys. Velocity rewards new work that is already taking off."""
+    age = months_old(p, today)
+    months = max(age if age is not None else 60, 1)
+    repo = best_repo(p) or {}
+    repo_months = max(months_since(repo.get("created"), today) or months, 1)
+    score = (math.log10(1 + (p.get("citationCount") or 0) / months)
+             + 0.5 * math.log10(1 + (repo.get("stars") or 0) / repo_months))
+    if age is not None and age <= cfg["recent_months"]:
+        score += 0.5
+    if SURVEY_RE.search(p.get("title") or ""):
+        score -= 0.5
+    return round(score, 3)
 
 
-def balanced_pick(recs: list, n: int) -> list:
-    """Fill n slots across lineages in proportion to sqrt(lineage size), with the seed's own citers weighted double.
-    One tightly co-cited cluster (e.g. the papers citing a dataset paper's benchmarked models) cannot take every slot,
-    and a small lineage cannot pad the list with weak papers. Each lineage is consumed best rank first."""
+def velocity(p: dict, today: dt.date) -> float:
+    age = months_old(p, today)
+    return (p.get("citationCount") or 0) / max(age if age is not None else 60, 1)
+
+
+def balanced_pick(recs: list, n: int, key: str = "lineage") -> list:
+    """Fill n slots across groups (recs[key]) in proportion to sqrt(group size), each group best score first. One
+    tightly co-cited cluster (e.g. the citers of a single famous baseline) cannot take every slot, and a small group
+    cannot pad the list with weak papers."""
     groups = {}
-    for rec in sorted(recs, key=lambda r: -r["rank"]):
-        groups.setdefault(rec["lineage"], []).append(rec)
-    weight = {g: math.sqrt(len(items)) * (2.0 if g == "seed" else 1.0) for g, items in groups.items()}
+    for rec in sorted(recs, key=lambda r: -r["score"]):
+        groups.setdefault(rec.get(key) or "-", []).append(rec)
+    weight = {g: math.sqrt(len(items)) for g, items in groups.items()}
     taken = {g: 0 for g in groups}
     out = []
     while len(out) < n and any(groups.values()):
-        g = min((g for g in groups if groups[g]), key=lambda g: (taken[g] / weight[g], -groups[g][0]["rank"]))
+        g = min((g for g in groups if groups[g]), key=lambda g: (taken[g] / weight[g], -groups[g][0]["score"]))
         out.append(groups[g].pop(0))
         taken[g] += 1
-    return out
+    return sorted(out, key=lambda r: -r["score"])
 
 
 def same_title(a: str | None, b: str | None) -> bool:
@@ -2044,66 +2128,809 @@ def same_title(a: str | None, b: str | None) -> bool:
     return any(":" in (x or "") and norm(x.split(":", 1)[1]) == norm(y) for x, y in ((a, b), (b, a)))
 
 
+def one_survey(recs: list) -> tuple:
+    """-> (recs with only the best-ranked survey kept, the other surveys)."""
+    kept, extra, seen = [], [], False
+    for rec in recs:
+        if SURVEY_RE.search(rec.get("title") or ""):
+            if seen:
+                extra.append(rec)
+                continue
+            seen = True
+        kept.append(rec)
+    return kept, extra
+
+
+def topic_hits(p: dict, keywords: list) -> list:
+    """Keyword phrases (normalized) found in the title, or - multi-word phrases only, since single words match
+    abstracts too easily - in the abstract."""
+    title = " %s " % norm(p.get("title"))
+    abstract = " %s " % norm(p.get("abstract"))
+    return [k for k in keywords if (" %s " % k) in title or (" " in k and (" %s " % k) in abstract)]
+
+
 def dedupe_titles(recs: list, against: list = ()) -> list:
     """Semantic Scholar sometimes has two records for one paper (e.g. "Semantic-SAM: X" and the venue version "X").
     Keep the first, best-ranked record of each title, and drop records duplicating one in `against`."""
     kept = []
     for rec in recs:
-        title = rec["paper"].get("title")
-        if any(same_title(title, other["paper"].get("title")) for other in list(against) + kept):
+        if any(same_title(rec.get("title"), other.get("title")) for other in list(against) + kept):
             continue
         kept.append(rec)
     return kept
 
 
-def write_briefs(wd: str, seed: dict, papers: list) -> None:
-    lines = ["# Briefs for writing diffs.json", "",
-             "Seed: %s (%s)" % (seed.get("title"), seed.get("year")), "",
-             "Seed abstract: %s" % (seed.get("abstract") or "(none)"), "",
-             "Write diffs.json as {\"<key>\": \"one sentence: how it differs from the seed\"}; "
-             "use \"EXCLUDE: <reason>\" to drop an off-topic paper.", ""]
-    for p in papers:
-        if p["bucket"] == "overflow":
+def cocite_stats(co: dict, today: dt.date) -> dict:
+    """paperId -> co-citation numbers for every paper in a pool's `cocitation` block:
+
+    k_b      how many of the seeds and their compared works cite it (out of n_b with a reference list)
+    support  how many recent area papers cite it, out of `eligible`: those published after it, the only ones that
+             could; share = support / eligible, with eligible floored at COCITE['min_eligible'] so 2 of 3 is not 67%
+    idf      specificity, log(corpus size / its citations): COCO and CLIP are cited everywhere, PartImageNet is not
+    """
+    n_b = co.get("backward_have") or 0
+    dates = sorted(co.get("area_dates") or [])
+    backward, forward = co.get("backward") or {}, co.get("forward") or {}
+    out = {}
+    for pid, m in (co.get("meta") or {}).items():
+        date = m.get("publicationDate") or ("%s-07-01" % m["year"] if m.get("year") else "")
+        eligible = len(dates) - bisect.bisect_right(dates, date) if date else len(dates)
+        support = forward.get(pid, 0)
+        out[pid] = {"k_b": backward.get(pid, 0), "n_b": n_b, "support": support, "eligible": eligible,
+                    "share": support / max(eligible, COCITE["min_eligible"]),
+                    "idf": math.log(S2_CORPUS / max(m.get("citationCount") or 0, 1)), "age": months_old(m, today)}
+    return out
+
+
+def coupling_set(co: dict, stats: dict, exclude: set) -> set:
+    """The strongest backward co-citations: cited by at least 20% of the seeds and compared works, ranked by that share
+    times specificity. A follow-up that cites none of them is probably from another area (CRISP, a real2sim method that
+    cites InstructPart once, cites none of its 30)."""
+    n_b = co.get("backward_have") or 0
+    if not n_b:
+        return set()
+    k_min = max(2, math.ceil(COCITE["k_share"] * n_b))
+    ranked = sorted((pid for pid, s in stats.items() if s["k_b"] >= k_min and pid not in exclude),
+                    key=lambda pid: -(stats[pid]["k_b"] / n_b) * stats[pid]["idf"])
+    return set(ranked[:COCITE["coupling_top"]])
+
+
+# "We present LLaVA: ..." / "we introduce PixelLM, an LMM ...": the abstract introduces a named model.
+NAMED_INTRO_RE = re.compile(r"\b[Ww]e (?:present|introduce|propose)\s+(?!(?:a|an|the|this|our|two|three|new)\b)[A-Z]")
+# "We also present a new large-scale dataset" (RefCOCOg), "the game has produced a dataset" (ReferItGame).
+DATA_INTRO_RE = re.compile(r"\bwe (?:also )?(?:introduce|present|propose|release|construct|build|collect|curate|create)\s+"
+                           r"(?:a |an |the )?(?:new |novel )?(?:[\w-]+ ){0,3}(?:dataset|data set|benchmark|corpus)\b|"
+                           r"\b(?:collected|gathered|produced|crowd-?sourced)\s+(?:a |an )(?:new |novel )?(?:[\w-]+ ){0,3}"
+                           r"(?:dataset|benchmark|corpus)\b",
+                           re.I)
+
+
+def is_dataset(p: dict) -> bool:
+    """A dataset or benchmark paper, from the first signal that speaks:
+    1. the title ("ADE20K Dataset", "PartNet: A Large-Scale Benchmark");
+    2. the abstract introducing a named model ("We present LLaVA: ...") -> a model, unless that sentence says dataset;
+    3. the abstract introducing a dataset ("We also present a new large-scale dataset" in RefCOCOg's);
+    4. at least a third of the seeds and compared works that cite it in a citation sentence use it as data
+       (`cited_as_data` = [votes, of]).
+    Heuristics miss some (PACO introduces itself by name); the agent fixes those with "kind" in diffs.json."""
+    if DATA_TITLE_RE.search(p.get("title") or ""):
+        return True
+    abstract = p.get("abstract") or ""
+    named = NAMED_INTRO_RE.search(abstract)
+    if named:  # only the words right after it: abstracts sometimes run sentences together ("understanding.Our ...")
+        return bool(re.search(r"\b(datasets?|benchmarks?|corpus)\b", abstract[named.start():named.start() + 160], re.I))
+    if DATA_INTRO_RE.search(abstract):
+        return True
+    votes, of = (p.get("cited_as_data") or [0, 0])[:2]
+    return bool(of) and votes * 3 >= of
+
+
+def merge_twins(rows: list) -> list:
+    """One row per dataset. Semantic Scholar keeps journal and conference versions apart ("Scene Parsing through ADE20K
+    Dataset" and "Semantic Understanding of Scenes Through the ADE20K Dataset"); dataset rows sharing a name token with
+    digits are merged into the better-ranked one, which lists the other under `twins`."""
+    out, names = [], []
+    for row in rows:
+        toks = {t for t in norm(row.get("title")).split() if len(t) >= 5 and re.fullmatch(r"[a-z]+\d+[a-z0-9]*", t)}
+        twin = next((o for o, n in zip(out, names) if row.get("kind") == "data" == o.get("kind") and toks & n), None)
+        if twin is not None:
+            twin.setdefault("twins", []).append(row.get("title"))
             continue
-        text = p.get("tldr") or (p.get("abstract") or "")[:700]
-        lines.append("## %s | %s (%s) | %s cites | %s" % (p["key"], p["title"], p.get("year"), p.get("citationCount"), p["relation"]))
-        lines.append(text or "(no abstract available - judge from the title or skim the paper)")
+        out.append(row)
+        names.append(toks)
+    return out
+
+
+def foundations(co: dict, stats: dict, exclude: set, cfg: dict, kinds: dict | None = None) -> list:
+    """Section A2, what the field builds on. Path (a): cited by at least 20% (and 3) of the seeds and their compared
+    works, and confirmed by recent area papers citing it too. Path (b): an older paper cited by at least 25% of recent
+    area papers (field consensus, e.g. PixelLM and GLaMM for InstructPart). Both need COCITE['min_citations'].
+    Ranked by (backward share + forward share) x specificity; datasets and benchmarks, then models and methods, at most
+    --max-foundations of each. Without enough recent area papers to confirm anything, path (a) needs no confirmation."""
+    n_b = co.get("backward_have") or 0
+    can_confirm = (co.get("area_size") or 0) >= COCITE["min_eligible"]
+    k_min = max(COCITE["k_min"], math.ceil(COCITE["k_share"] * n_b)) if n_b else None
+    rows = []
+    for pid, s in stats.items():
+        m = co["meta"][pid]
+        if pid in exclude or (m.get("citationCount") or 0) < COCITE["min_citations"]:
+            continue
+        confirmed = s["share"] >= COCITE["confirm_share"] and s["support"] >= COCITE["confirm_support"]
+        path_a = k_min is not None and s["k_b"] >= k_min and (confirmed or not can_confirm)
+        older = s["age"] is None or s["age"] > cfg["latest_months"]
+        path_b = (can_confirm and older and s["share"] >= COCITE["consensus_share"]
+                  and s["support"] >= COCITE["confirm_support"])
+        if not (path_a or path_b):
+            continue
+        kind = (kinds or {}).get(short_id(pid)) or ("data" if is_dataset(m) else "model")
+        rows.append(dict(m, section="foundation", kind=kind, k_b=s["k_b"], n_b=n_b,
+                         support_f=s["support"], eligible=s["eligible"], share_f=round(s["share"], 3),
+                         score=round((s["k_b"] / max(n_b, 1) + s["share"]) * s["idf"], 3)))
+    rows = merge_twins(dedupe_titles(sorted(rows, key=lambda r: -r["score"])))
+    cap = cfg["max_foundations"]
+    return [r for r in rows if r["kind"] == "data"][:cap] + [r for r in rows if r["kind"] == "model"][:cap]
+
+
+def latest_models(co: dict, stats: dict, exclude: set, cfg: dict) -> list:
+    """Section C, the latest models to keep an eye on: papers from the last --latest-months cited by at least 15% (and
+    4) of the area papers published after them (at least 10 could have). Reaches new models no citation search can:
+    Semantic Scholar has no reference list for SAM 3 or Qwen2.5-VL, but 22-25% of InstructPart's recent area cites
+    them. Ranked by that share."""
+    rows = []
+    for pid, s in stats.items():
+        if pid in exclude or s["age"] is None or s["age"] > cfg["latest_months"]:
+            continue
+        if (s["support"] < COCITE["latest_support"] or s["eligible"] < COCITE["min_eligible"]
+                or s["share"] < COCITE["latest_share"]):
+            continue
+        rows.append(dict(co["meta"][pid], section="latest", support_f=s["support"], eligible=s["eligible"],
+                         share_f=round(s["share"], 3), score=round(s["share"], 3)))
+    return dedupe_titles(sorted(rows, key=lambda r: -r["score"]))[:cfg["max_latest"]]
+
+
+def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date, skip_keys=frozenset(),
+                  kinds: dict | None = None) -> dict:
+    """Split the screened pool into the report's sections. Pure: no network.
+
+    compared     (A1) included core papers with a table role: every one, no citation bar
+    related           included core papers from related work, unless A2 has them: one line in section A
+    foundations  (A2) what the seeds and their compared works build on (see foundations())
+    follow_ups   (B)  influential papers citing a seed; when fewer than min_forward (or expand=always), also on-topic
+                      papers citing the compared works, balanced across them. Every one passes its gate and the
+                      same-area check: it cites one of the strongest backward co-citations (coupling_set()). A paper
+                      whose reference list is unknown passes on its citation edge (plus the topic match when widening)
+    latest       (C)  the latest models the area builds on (see latest_models())
+    also              gate passers beyond the caps, and surveys after the first
+    `skip_keys` are 8-character keys the agent excluded in diffs.json: they leave every section, so the next
+    candidates move up. `kinds` maps keys to "data" / "model" where the agent corrected an A2 classification.
+    """
+    seed_ids = {s["paperId"] for s in seeds}
+    seed_key = {s["paperId"]: s["key"] for s in seeds}
+    ref_ids = {c["paperId"] for c in core if c.get("paperId")}
+    excluded_ids = {c["paperId"] for c in core if c.get("excluded") and c.get("paperId")}
+    included = [c for c in core if c.get("include") and c.get("paperId") and c["paperId"] not in seed_ids
+                and short_id(c["paperId"]) not in skip_keys]
+    core_ids = {c["paperId"] for c in included}
+    hub_cut = hub_cutoff(seeds)
+    weight = {c["paperId"]: (0.5 if (c.get("citationCount") or 0) >= hub_cut else 1.0) for c in included}
+    cites_of = {c["paperId"]: c.get("citationCount") or 0 for c in included}
+    name_of = {c["paperId"]: label(c.get("title")) for c in included}
+    compared = [dict(c, section="compared") for c in included if c["role"] in TABLE_ROLES]
+    related = [dict(c, section="related") for c in included if c["role"] == "related"]
+    compared.sort(key=lambda c: (ROLE_ORDER.get(c["role"], 9), -(c.get("citationCount") or 0)))
+    related.sort(key=lambda c: -(c.get("score") or 0))
+    compared_ids = {c["paperId"] for c in compared}
+
+    co = pool.get("cocitation") or {}
+    stats = cocite_stats(co, today)
+    couple = coupling_set(co, stats, exclude=seed_ids)
+    keywords = [norm(k) for k in pool["meta"].get("keywords") or [] if norm(k)]
+    expanded = bool(pool["meta"].get("expanded"))
+    seed_pass, expand_pass = [], []
+    for rec in pool["papers"]:
+        pid = rec["paperId"]
+        if pid in seed_ids or pid in core_ids or pid in excluded_ids or short_id(pid) in skip_keys:
+            continue
+        cited = set(rec.get("cited") or [])
+        if pid in ref_ids and not cited & seed_ids:
+            # A seed's own reference is backward work, not new work - unless it cites another seed (with LoRA and DoRA
+            # as seeds, QLoRA is a DoRA reference and a LoRA citer).
+            continue
+        topical = bool(topic_hits(rec, keywords)) or "topic-search" in (rec.get("sources") or [])
+        coupling = len(cited & couple)
+        same_area = not couple or coupling >= cfg["min_coupling"] or not rec.get("verified")
+        core_hits = sorted(cited & core_ids, key=lambda c: cites_of[c])  # most specific (least cited) first
+        core_score = sum(weight[c] for c in core_hits)
+        row = dict(rec, cites_seeds=sorted(seed_key[s] for s in cited & seed_ids), n_core=len(core_hits),
+                   core_score=core_score, topical=topical, coupling=coupling,
+                   builds_on=[name_of[c] for c in core_hits if weight[c] == 1.0][:4] or [name_of[c] for c in core_hits][:4])
+        if row["cites_seeds"]:
+            reason = gate(rec, "seed", cfg, today) if same_area else None
+            if reason:
+                row.update(route="seed", section="follow_up", gate=reason, score=sota_score(rec, today, cfg),
+                           lineage="+".join(row["cites_seeds"]))
+                seed_pass.append(row)
+            continue
+        if not expanded:
+            continue
+        # Widening must stay on the seed's topic: co-citing two general baselines (Shikra, MiniGPT-v2) is what every
+        # new multimodal LLM does, so citing a compared work only counts together with a topic match.
+        if not (core_hits and topical and same_area):
+            continue
+        reason = gate(rec, "expand", cfg, today, core_score)
+        if reason:
+            row.update(route="expand", section="follow_up", gate=reason, score=sota_score(rec, today, cfg),
+                       lineage=next((c for c in core_hits if weight[c] == 1.0), core_hits[0]))
+            expand_pass.append(row)
+
+    backward = compared + related
+    seed_pass = dedupe_titles(sorted(seed_pass, key=lambda r: -r["score"]), against=backward)
+    expand_pass = dedupe_titles(sorted(expand_pass, key=lambda r: -r["score"]), against=backward + seed_pass)
+    # One survey per section is useful for a newcomer; more crowd out primary work (they go to "also").
+    seed_pass, seed_surveys = one_survey(seed_pass)
+    expand_pass, expand_surveys = one_survey(expand_pass)
+    seed_kept = balanced_pick(seed_pass, cfg["max_follow_ups"])
+    show_expand = expanded and (cfg["expand"] == "always"
+                                or (cfg["expand"] == "auto" and len(seed_pass) < cfg["min_forward"]))
+    if show_expand and seed_kept and any(SURVEY_RE.search(r.get("title") or "") for r in seed_kept):
+        expand_pass, more = one_survey([{"title": "survey"}] + expand_pass)  # the section already has its survey
+        expand_pass, expand_surveys = expand_pass[1:], expand_surveys + more
+    expand_kept = balanced_pick(expand_pass, max(cfg["max_follow_ups"] - len(seed_kept), 0)) if show_expand else []
+    follow_ups = seed_kept + expand_kept
+    kept_ids = {r["paperId"] for r in follow_ups}
+    also = [r for r in seed_pass + seed_surveys + ((expand_pass + expand_surveys) if show_expand else [])
+            if r["paperId"] not in kept_ids]
+    for r in also:
+        r.pop("abstract", None)  # the report lists these by title only
+        r["section"] = "also"
+    also.sort(key=lambda r: -r["score"])
+
+    # `core --exclude` keeps a paper out of the comparison set and the citer search (hubs such as SAM), not out of A2
+    # and C: a widely co-cited hub is a foundation. EXCLUDE in diffs.json removes it from the report.
+    taken = seed_ids | compared_ids | {pid for pid in (co.get("meta") or {}) if short_id(pid) in skip_keys}
+    found = dedupe_titles(foundations(co, stats, taken, cfg, kinds), against=compared)
+    found_ids = {r["paperId"] for r in found}
+    related = [r for r in related if r["paperId"] not in found_ids]
+    latest = latest_models(co, stats, taken | found_ids | kept_ids, cfg)
+    latest = dedupe_titles(latest, against=backward + found + follow_ups)
+    for r in follow_ups:  # a follow-up that recent work already builds on is worth saying so
+        s = stats.get(r["paperId"])
+        if s and s["share"] >= COCITE["latest_share"] and s["support"] >= COCITE["latest_support"]:
+            r.update(share_f=round(s["share"], 3), support_f=s["support"], eligible=s["eligible"])
+
+    if cfg["expand"] == "never":
+        why = "turned off (--expand never)"
+    elif not show_expand and not expanded and (cfg["expand"] == "always" or len(seed_pass) < cfg["min_forward"]):
+        why = "needed, but `forward` did not search it; re-run `forward` (cached) with these settings"
+    elif show_expand:
+        why = ("forced (--expand always)" if cfg["expand"] == "always" else
+               "only %d influential paper%s cite%s the seed%s, fewer than %d"
+               % (len(seed_pass), "" if len(seed_pass) == 1 else "s", "s" if len(seed_pass) == 1 else "",
+                  "s" if len(seeds) > 1 else "", cfg["min_forward"]))
+    else:
+        why = "not needed: %d influential papers cite the seed%s" % (len(seed_pass), "s" if len(seeds) > 1 else "")
+    return {"compared": compared, "related": related, "foundations": found, "follow_ups": follow_ups,
+            "latest": latest, "also": also[:max(cfg["max_also"] * 5, 100)], "n_seed_pass": len(seed_pass),
+            "n_expand_pass": len(expand_pass), "expanded": show_expand, "expand_why": why,
+            "coupling_set": sorted(couple)}
+
+
+# ----------------------------------------------------------------------------- forward / select
+
+def probe_code(http: Http, recs: list, cfg: dict, label_: str) -> None:
+    """Cheap code probe before selection, for papers below the citation bars: the repo linked on the paper's Hugging
+    Face page or in its arXiv comment / abstract, with stars; the README is read only when the stars reach the lowest
+    stars bar. Writes rec['code'] like find_code (no GitHub search, no Hugging Face artifacts)."""
+    todo = [r for r in recs if "code" not in r and (r.get("externalIds") or {}).get("ArXiv")]
+    if not todo:
+        return
+    log("  probing GitHub stars for %d %s ..." % (len(todo), label_))
+    find_code(http, todo, use_search=False, with_hf=False, with_docs=False, rest_budget=0)
+    stars = [s for _, s in cfg["gates"].values() if s]
+    add_docs(http, todo, github_token(), min_stars=min(stars) if stars else 0)
+
+
+def backward_cocitation(http: Http, ids: list) -> tuple:
+    """Reference lists of the seeds and compared works, with citation sentences -> (Counter: how many of them cite each
+    paper, Counter: how many cite it in a sentence with citation sentences, Counter: how many of those sentences read
+    as dataset use ("we evaluate on RefCOCO [12]"), how many reference lists Semantic Scholar had). The sentences tell
+    datasets from models: RefCOCOg's title, "Generation and Comprehension of Unambiguous Object Descriptions", does
+    not."""
+    counts, seen, votes, have = collections.Counter(), collections.Counter(), collections.Counter(), 0
+    for pid in ids:
+        edges = [e for e in s2_edges(http, pid, "references", "contexts,paperId", cap=2000)
+                 if (e.get("citedPaper") or {}).get("paperId")]
+        if not edges:
+            continue
+        have += 1
+        for e in edges:
+            cid = e["citedPaper"]["paperId"]
+            counts[cid] += 1
+            contexts = e.get("contexts") or []
+            if contexts:
+                seen[cid] += 1
+                votes[cid] += int(sum(1 for c in contexts if DATA_CTX_RE.search(c)) * 2 >= len(contexts))
+    return counts, seen, votes, have
+
+
+def slim(p: dict) -> dict:
+    """What `select` needs to know about a co-cited paper (the abstract only to tell datasets from methods)."""
+    out = {k: p.get(k) for k in ("paperId", "title", "year", "venue", "publicationDate", "citationCount", "externalIds")}
+    out["abstract"] = (p.get("abstract") or "")[:1500]
+    return out
+
+
+def cmd_forward(args) -> None:
+    wd = workdir_for(args)
+    seeds = load_seeds(wd)
+    core = load_json(os.path.join(wd, "core.json"), []) or []
+    http = Http(args.cache_dir, refresh=args.refresh)
+    today = dt.date.today()
+    cfg = selection_config(args)
+    keyed = bool(s2_key())
+    seed_cap = args.seed_cap or (9999 if keyed else 3000)
+    core_cap = args.cap or (3000 if keyed else 1000)
+    keywords = [k.strip().lower() for k in (args.keywords or "").split(",") if k.strip()]
+    query = args.query or (" | ".join(('"%s"' % k) if " " in k else k for k in keywords) if keywords else None)
+    if not keywords:
+        keywords = sorted({k for s in seeds for k in keywords_from(s.get("title") or "")})
+    kw_norm = [norm(k) for k in keywords if norm(k)]
+    seed_ids = [s["paperId"] for s in seeds]
+    seed_set = set(seed_ids)
+    included = [c for c in core if c.get("include") and c.get("paperId") and c["paperId"] not in seed_set]
+    # Every reference of every seed is a target, so later `core` edits can be re-scored by `select` without network.
+    targets = seed_set | {c["paperId"] for c in core if c.get("paperId")}
+    excluded_ids = {c["paperId"] for c in core if c.get("excluded") and c.get("paperId")}
+    hub_cut = hub_cutoff(seeds)
+    weight = {c["paperId"]: (0.5 if (c.get("citationCount") or 0) >= hub_cut else 1.0) for c in included}
+    core_ids = set(weight)
+    pool = {}  # paperId -> candidate record
+
+    def add(paper: dict, source: str, cited: str | None = None, influential: bool = False):
+        pid = paper.get("paperId")
+        if not pid or pid in seed_set or pid in excluded_ids:
+            return None
+        rec = pool.get(pid)
+        if rec is None:
+            rec = pool[pid] = {k: paper.get(k) for k in ("paperId", "title", "year", "venue", "publicationDate",
+                                                          "citationCount", "externalIds")}
+            rec.update(sources=set(), cited=set(), influential=0, verified=False)
+        else:
+            for k in ("title", "year", "venue", "publicationDate", "externalIds"):
+                if rec.get(k) is None and paper.get(k) is not None:
+                    rec[k] = paper[k]
+            if (paper.get("citationCount") or 0) > (rec.get("citationCount") or 0):
+                rec["citationCount"] = paper["citationCount"]
+        rec["sources"].add(source)
+        if cited and cited != pid:  # Semantic Scholar occasionally lists a paper among its own citers
+            rec["cited"].add(cited)
+        rec["influential"] += int(bool(influential))
+        return rec
+
+    oa = OpenAlex(http, args.openalex_budget) if args.openalex_budget > 0 else None
+    oa_wanted = {}  # Semantic Scholar id -> (OpenAlex title, set of cited paperIds)
+
+    def queue_openalex(paper: dict, min_cites: int, since: str | None = None) -> None:
+        wid = oa.work_id(paper)
+        for w in (oa.top_citers(wid, min_cites=min_cites, since=since) if wid else []):
+            for sid in OpenAlex.s2_ids(w):
+                oa_wanted.setdefault(sid, (w.get("display_name"), set()))[1].add(paper["paperId"])
+
+    def resolve_openalex(source: str) -> int:
+        found = s2_batch(http, list(oa_wanted), fields=PAPER_FIELDS)
+        matched = 0
+        for sid, p in found.items():
+            title, cited_ids = oa_wanted[sid]
+            if title_close(p.get("title"), title):  # drops OpenAlex mis-merges
+                for cid in cited_ids:
+                    add(p, source, cid)
+                matched += 1
+        oa_wanted.clear()
+        return matched
+
+    def title_topical(r: dict) -> bool:
+        return bool(topic_hits(r, kw_norm)) or "topic-search" in r["sources"]
+
+    # Backward co-citation: what the seeds and their compared works all cite (section A2's first path). The strongest
+    # candidates join the verification targets, so `select` can tell offline which of them each follow-up cites.
+    backward_set = seed_ids + [c["paperId"] for c in included]
+    log("Co-citation: reading the reference lists of the seed%s and %d compared works ..."
+        % ("s" if len(seeds) > 1 else "", len(included)))
+    bw_counts, bw_seen, bw_votes, bw_have = backward_cocitation(http, backward_set)
+    bw_ids = [pid for pid, k in bw_counts.most_common(400) if k >= 2 and pid not in seed_set]
+    co_meta = {pid: slim(p) for pid, p in s2_batch(http, bw_ids, fields=PAPER_FIELDS + ",abstract", chunk=500).items()}
+    for pid, m in co_meta.items():  # how the seeds and compared works cite it: as a dataset, or not
+        m["cited_as_data"] = [bw_votes.get(pid, 0), bw_seen.get(pid, 0)]
+    ranked = sorted(co_meta, key=lambda pid: -bw_counts[pid] * math.log(S2_CORPUS / max(co_meta[pid]["citationCount"] or 0, 1)))
+    targets |= set(ranked[:200])
+    log("  %d of %d reference lists found; %d papers are cited by at least 2 of them"
+        % (bw_have, len(backward_set), len(bw_ids)))
+
+    def cocitation_block(forward: dict, area_dates: list) -> dict:
+        return {"backward_set": backward_set, "backward_have": bw_have,
+                "backward": {pid: bw_counts[pid] for pid in co_meta if bw_counts.get(pid, 0) >= 2},
+                "area_size": len(area_dates), "area_dates": sorted(area_dates), "forward": forward, "meta": co_meta}
+
+    # Route B: everything that cites a seed (complete unless a seed has more than seed_cap citers).
+    log("Route B: papers citing the %s ..." % ("seed" if len(seeds) == 1 else "%d seeds" % len(seeds)))
+    n_seed_citers = 0
+    for s in seeds:
+        edges = s2_edges(http, s["paperId"], "citations", CIT_FIELDS, cap=seed_cap)
+        for e in edges:
+            add(e.get("citingPaper") or {}, "seed-citers", s["paperId"], e.get("isInfluential"))
+        n_seed_citers += len(edges)
+        partial = (s.get("citationCount") or 0) > len(edges)
+        log("  %-60s %6d citers%s" % ((s.get("title") or "")[:60], len(edges), " (newest only)" if partial else ""))
+        if oa and partial:
+            queue_openalex(s, min_cites=cfg["gates"]["seed.recent"][0] or 0)
+    if oa_wanted:
+        log("  OpenAlex: %d most-cited citers matched in Semantic Scholar" % resolve_openalex("openalex"))
+    b_recs = list(pool.values())
+    if not args.no_code:
+        contenders = [r for r in b_recs if not gate(r, "seed", cfg, today)]
+        contenders.sort(key=lambda r: -velocity(r, today))
+        probe_code(http, contenders[:args.probe_cap], cfg, "seed citers below the citation bars")
+    # The same-area check needs each passer's reference list, so check those now.
+    b_pass = sorted((r for r in b_recs if gate(r, "seed", cfg, today)), key=lambda r: -(r.get("citationCount") or 0))
+    n_verified, no_reflist = verify_refs(http, pool, [r["paperId"] for r in b_pass[:args.verify_cap]], targets)
+    # Count B exactly as `select` will (same checks, dedupe, survey cap, agent exclusions), so both agree on widening.
+    view = {"meta": {"keywords": [], "expanded": False}, "cocitation": cocitation_block({}, []),
+            "papers": [dict(r, cited=sorted(r["cited"]), sources=sorted(r["sources"])) for r in b_recs]}
+    skip = {k for k, d in load_diffs(wd).items() if d["exclude"]}
+    n_b = select_papers(view, seeds, core, cfg, today, skip_keys=skip)["n_seed_pass"]
+    n_recent = sum(1 for r in b_recs if (months_old(r, today) if months_old(r, today) is not None else 999)
+                   <= cfg["latest_months"])
+    expand = args.expand == "always" or (args.expand == "auto" and (n_b < cfg["min_forward"]
+                                                                    or n_recent < cfg["min_area"]))
+    if not included and expand:
+        log("  No core papers are included, so there is nothing to widen to (see `core`).")
+        expand = False
+    why = ("--expand always" if args.expand == "always" else
+           "fewer than %d pass" % cfg["min_forward"] if n_b < cfg["min_forward"] else
+           "only %d recent papers cite the seed, too few to see what the area builds on" % n_recent)
+    log("  %d papers citing the seed%s pass the influence gate and the same-area check%s"
+        % (n_b, "s" if len(seeds) > 1 else "", "; widening to the compared works' citers (%s)" % why if expand else ""))
+
+    n_topic = 0
+    since = (today - dt.timedelta(days=int(max(cfg["mid_months"], cfg["latest_months"]) * 30.44))).isoformat()
+    if expand:
+        # Newest citers of each non-hub compared work: newest-first order is exactly what a SOTA search wants.
+        log("Widening: recent papers citing the compared works (%d core papers) ..." % len(included))
+        for c in included:
+            if weight[c["paperId"]] < 1:
+                log("  %-60s skipped: hub (%s citations), its citers are mostly unrelated"
+                    % ((c["title"] or "")[:60], human(c.get("citationCount"))))
+                continue
+            edges = s2_edges(http, c["paperId"], "citations", CIT_FIELDS, cap=core_cap)
+            for e in edges:
+                add(e.get("citingPaper") or {}, "core-citers", c["paperId"], e.get("isInfluential"))
+            partial = (c.get("citationCount") or 0) > len(edges)
+            if oa and partial:
+                queue_openalex(c, min_cites=cfg["gates"]["expand.recent"][0] or 0, since=since)
+            log("  %-60s %6d citers%s" % ((c["title"] or "")[:60], len(edges), " (newest only)" if partial else ""))
+        # Citation-sorted topic search over the same window.
+        if query and not args.no_topic_search:
+            hits = s2_bulk_search(http, query, min_citations=5, limit=args.topic_limit, since=since)
+            for p in hits:
+                add(p, "topic-search")
+            n_topic = len(hits)
+            log("  topic search %s since %s: %d papers with at least 5 citations" % (query, since, n_topic))
+        elif not query:
+            log("  No --query/--keywords given, so no topic search.")
+        # OpenAlex's most-cited recent citers of partially fetched compared works.
+        if oa_wanted:
+            log("  OpenAlex: %d most-cited recent citers matched in Semantic Scholar" % resolve_openalex("openalex"))
+
+    def c_candidate(r: dict) -> bool:  # could be a widening row: cites a compared work (or is unverified), not a seed
+        return not (r["cited"] & seed_set) and bool(r["cited"] & core_ids or not r["verified"])
+
+    if expand:
+        # Verify reference lists: which seeds, compared works and foundations each plausible candidate cites.
+        to_verify = [pid for pid, r in pool.items() if not r["verified"] and c_candidate(r)
+                     and gate(r, "expand", cfg, today, core_score=99)]
+        to_verify.sort(key=lambda pid: -(pool[pid].get("citationCount") or 0))
+        a, b = verify_refs(http, pool, to_verify[:args.verify_cap], targets)
+        n_verified, no_reflist = n_verified + a, no_reflist + b
+        # Abstracts let `select` judge the topic from more than the title: fetched for papers that pass the gate on
+        # citations and for the fastest-rising ones below it (stars candidates), kept only where a keyword phrase hits.
+        passing = [r for r in pool.values() if c_candidate(r) and not title_topical(r) and gate(r, "expand", cfg, today, 99)]
+        rising = [r for r in pool.values() if c_candidate(r) and not title_topical(r) and not gate(r, "expand", cfg, today, 99)
+                  and bracket_of(months_old(r, today), cfg) != "old"]
+        rising.sort(key=lambda r: -velocity(r, today))
+        need = [r["paperId"] for r in passing + rising[:3 * args.probe_cap]]
+        if need:
+            log("  reading %d abstracts to check the topic beyond titles ..." % len(need))
+        for pid, d in s2_batch(http, need, fields="paperId,abstract", chunk=500).items():
+            text = (d.get("abstract") or "")[:2000]
+            if topic_hits({"abstract": text}, kw_norm):
+                pool[pid]["abstract"] = text
+    if expand and not args.no_code:  # stars probe for on-topic widening candidates below the citation bars
+        contenders = [r for r in pool.values() if c_candidate(r) and "code" not in r and title_topical(r)
+                      and bracket_of(months_old(r, today), cfg) != "old" and not gate(r, "expand", cfg, today, 99)]
+        contenders.sort(key=lambda r: -velocity(r, today))
+        probe_code(http, contenders[:args.probe_cap], cfg, "recent widening candidates below the citation bars")
+        starred = [r["paperId"] for r in contenders[:args.probe_cap]
+                   if not r["verified"] and gate(r, "expand", cfg, today, 99)]
+        a, b = verify_refs(http, pool, starred, targets)
+        n_verified, no_reflist = n_verified + a, no_reflist + b
+    if not args.no_code:  # papers that pass on citations need their stars too: the SOTA score ranks with them
+        passers = [r for r in pool.values() if "code" not in r and (
+            gate(r, "seed", cfg, today) if r["cited"] & seed_set else
+            expand and c_candidate(r) and title_topical(r) and gate(r, "expand", cfg, today, 99))]
+        passers.sort(key=lambda r: -velocity(r, today))
+        probe_code(http, passers[:args.probe_cap], cfg, "papers above the citation bars")
+
+    # Forward co-citation: what the area's recent papers cite (A2's second path and section C). It reaches new models
+    # that no citation search can: Semantic Scholar has no reference list for SAM 3 or Qwen2.5-VL, so they never show
+    # up as citers of anything, but recent papers in the area cite them.
+    def in_area(r: dict) -> bool:
+        age = months_old(r, today)
+        if age is None or age > cfg["latest_months"]:
+            return False
+        return bool(r["cited"] & seed_set) or (bool(r["cited"] & core_ids) and title_topical(r))
+
+    area = sorted((r for r in pool.values() if in_area(r)), key=lambda r: r.get("publicationDate") or "", reverse=True)
+    area = area[:args.area_cap or (1000 if keyed else 400)]
+    log("Co-citation: reading the reference lists of %d recent papers in the area ..." % len(area))
+    fw_reflists = s2_reference_ids(http, [r["paperId"] for r in area])
+    fw_counts, area_dates = collections.Counter(), []
+    for r in area:
+        refs = fw_reflists.get(r["paperId"])
+        date = r.get("publicationDate") or ("%s-07-01" % r["year"] if r.get("year") else "")
+        if refs and date:
+            fw_counts.update(refs)
+            area_dates.append(date)
+    fw_top = [pid for pid, n in fw_counts.most_common(300) if n >= 2 and pid not in seed_set]
+    more = [pid for pid in fw_top if pid not in co_meta]
+    co_meta.update({pid: slim(p) for pid, p in s2_batch(http, more, fields=PAPER_FIELDS + ",abstract", chunk=500).items()})
+    cocitation = cocitation_block({pid: fw_counts[pid] for pid in fw_top if pid in co_meta}, area_dates)
+    log("  %d of them have reference lists; %d papers are cited by at least 2" % (len(area_dates), len(fw_top)))
+
+    meta = {"generated": today.isoformat(), "version": VERSION, "seed_keys": [s["key"] for s in seeds],
+            "keywords": keywords, "query": query,
+            "since": since if expand else None, "seed_cap": seed_cap, "cap": core_cap, "seed_citers": n_seed_citers,
+            "core_used": len(included), "hubs_skipped": sum(1 for w in weight.values() if w < 1) if expand else 0,
+            "topic_hits": n_topic, "pool": len(pool), "verified": n_verified, "no_reference_list": no_reflist,
+            "probed": sum(1 for r in pool.values() if "code" in r), "github_token": bool(github_token()),
+            "openalex_calls": oa.used if oa else 0, "expanded": expand, "expand_mode": args.expand,
+            "settings": {k: v for k, v in cfg.items()}, "s2_busy_retries": http.s2_busy, "failures": http.failures,
+            "http_calls": http.counts}
+    meta["settings"]["gates"] = {k: list(v) for k, v in cfg["gates"].items()}
+    papers = []
+    for r in pool.values():  # keep what a later `select` could use: anything connected to a seed or its references
+        if not r["cited"] and "topic-search" not in r["sources"]:
+            continue
+        papers.append(dict(r, sources=sorted(r["sources"]), cited=sorted(r["cited"])))
+    out = {"meta": meta, "papers": papers, "cocitation": cocitation}
+    save_json(os.path.join(wd, "pool.json"), out)
+    log("Saved %d screened papers to pool.json (%d reference lists checked, %d without one)."
+        % (len(papers), n_verified, no_reflist))
+    run_select(wd, seeds, core, out, cfg, http, args)
+
+
+def verify_refs(http: Http, pool: dict, ids: list, targets: set) -> tuple:
+    """Fetch the reference lists of `ids` and record which targets each cites. -> (verified, no reference list)."""
+    ids = [pid for pid in ids if not pool[pid]["verified"]]
+    if not ids:
+        return 0, 0
+    log("Checking the reference lists of %d candidates ..." % len(ids))
+    # Candidates with no observed citation edge (topic search / OpenAlex hits) depend entirely on this check.
+    reflists = s2_reference_ids(http, ids, deep={pid for pid in ids if not pool[pid]["cited"]})
+    missing = 0
+    for pid in ids:
+        refs = reflists.get(pid)
+        if refs is None:
+            missing += 1
+            continue
+        pool[pid]["cited"] |= refs & targets
+        pool[pid]["verified"] = True
+    return len(ids) - missing, missing
+
+
+def cmd_select(args) -> None:
+    wd = workdir_for(args)
+    seeds = load_seeds(wd)
+    core = load_json(os.path.join(wd, "core.json"), []) or []
+    pool = load_json(os.path.join(wd, "pool.json"))
+    if not pool:
+        raise SystemExit("No pool.json in %s - run `forward` first." % wd)
+    cfg = selection_config(args, base=pool["meta"].get("settings"))
+    pool_core = {pid for r in pool["papers"] for pid in r.get("cited") or []}
+    new = [c for c in core if c.get("include") and c.get("paperId") and "added by hand" in (c.get("evidence") or [])
+           and c["paperId"] not in pool_core]
+    if new:
+        log("  NOTE: %d core paper(s) added with `core --add` after `forward` (%s); re-run `forward` to search their "
+            "citers." % (len(new), ", ".join(c["id"] for c in new)))
+    run_select(wd, seeds, core, pool, cfg, Http(args.cache_dir), args)
+
+
+def run_select(wd: str, seeds: list, core: list, pool: dict, cfg: dict, http: Http, args) -> None:
+    """Select, then fetch abstracts, BibTeX and code for the kept papers, and write candidates.json + briefs.md."""
+    today = dt.date.today()
+    diffs = load_diffs(wd)
+    skip = {k for k, d in diffs.items() if d["exclude"]}
+    kinds = {k: d["kind"] for k, d in diffs.items() if d.get("kind")}
+    sel = select_papers(pool, seeds, core, cfg, today, skip_keys=skip, kinds=kinds)
+    kept = sel["compared"] + sel["foundations"] + sel["follow_ups"] + sel["latest"]
+    details = s2_batch(http, [r["paperId"] for r in kept + sel["related"]], fields=KEPT_FIELDS)
+    for r in kept + sel["related"]:
+        d = details.get(r["paperId"]) or {}
+        for k, v in d.items():
+            if k != "code" and v is not None:
+                r[k] = v
+    if not args.no_code:
+        log("Looking up code for %d kept papers (Hugging Face, arXiv, GitHub) ..." % len(kept))
+        find_code(http, kept, use_search=not args.no_github_search)
+    for r in sel["follow_ups"]:  # the full lookup can change a probed repo's stars or README score
+        r["gate"] = gate(r, r["route"], cfg, today, r.get("core_score") or 0) or r["gate"]
+        r["score"] = sota_score(r, today, cfg)
+    out = [paper_record(r, today) for r in kept + sel["related"] + sel["also"]]
+    co = pool.get("cocitation") or {}
+    meta = dict(pool["meta"], selected=today.isoformat(), selection={k: v for k, v in cfg.items()},
+                expand_shown=sel["expanded"], expand_why=sel["expand_why"], n_seed_pass=sel["n_seed_pass"],
+                n_expand_pass=sel["n_expand_pass"], excluded_by_review=sorted(skip),
+                cocitation={"backward_set": len(co.get("backward_set") or []), "backward_have": co.get("backward_have") or 0,
+                            "area_size": co.get("area_size") or 0, "coupling_set": len(sel["coupling_set"])})
+    meta["selection"]["gates"] = {k: list(v) for k, v in cfg["gates"].items()}
+    save_json(os.path.join(wd, "candidates.json"), {"meta": meta, "papers": out})
+    write_briefs(wd, seeds, out)
+    print_select_summary(wd, out, meta, diffs)
+
+
+def paper_record(r: dict, today: dt.date) -> dict:
+    tldr = r.get("tldr")
+    bib = ((r.get("citationStyles") or {}).get("bibtex") if isinstance(r.get("citationStyles"), dict) else None)
+    return {
+        "key": short_id(r.get("paperId")), "paperId": r.get("paperId"), "title": r.get("title"), "year": r.get("year"),
+        "venue": r.get("venue"), "publicationDate": r.get("publicationDate"), "citationCount": r.get("citationCount"),
+        "influentialCitationCount": r.get("influentialCitationCount"), "externalIds": r.get("externalIds"),
+        "authors": [a.get("name") if isinstance(a, dict) else a for a in (r.get("authors") or [])][:6],
+        "tldr": tldr.get("text") if isinstance(tldr, dict) else tldr, "abstract": r.get("abstract"),
+        "publicationTypes": r.get("publicationTypes"), "link": paper_link(r), "bibtex": bib,
+        "section": r["section"], "route": r.get("route"), "role": r.get("role"), "kind": r.get("kind"),
+        "seeds": r.get("seeds") or r.get("cites_seeds") or [],
+        "gate": r.get("gate"), "score": r.get("score"), "age_months": months_old(r, today),
+        "builds_on": r.get("builds_on") or [], "lineage": r.get("lineage"), "n_core": r.get("n_core"),
+        "coupling": r.get("coupling"), "k_b": r.get("k_b"), "n_b": r.get("n_b"), "support_f": r.get("support_f"),
+        "eligible": r.get("eligible"), "share_f": r.get("share_f"), "twins": r.get("twins") or [],
+        "found_via": r.get("sources") or (["co-citation"] if r["section"] in ("foundation", "latest") else ["backward"]),
+        "verified": r.get("verified"), "evidence": r.get("evidence") or [], "code": r.get("code"),
+    }
+
+
+SECTION_LABEL = {"compared": "A1. compared in the seed", "foundation": "A2. foundation", "follow_up": "B. follow-up",
+                 "latest": "C. latest model", "related": "related work", "also": "also qualified"}
+SECTION_LETTER = {"compared": "A1", "foundation": "A2", "follow_up": "B", "latest": "C"}
+
+
+def pct(share) -> str:
+    return "%d%%" % round(100 * (share or 0))
+
+
+def cocite_note(p: dict) -> str:
+    """Why a paper is a foundation: "cited by 6 of 15 (seed + compared works) · 27% of recent area papers"."""
+    parts = []
+    if (p.get("k_b") or 0) >= 2:
+        parts.append("cited by %d of %d (seed + compared works)" % (p["k_b"], p.get("n_b") or 0))
+    if p.get("share_f"):
+        parts.append("%s of recent area papers" % pct(p["share_f"]))
+    return " · ".join(parts)
+
+
+def latest_note(p: dict) -> str:
+    """Why a paper is a latest model: "cited by 22% of the area's papers since it appeared (20 of 89)"."""
+    return "cited by %s of the area's papers since it appeared (%d of %d)" % (
+        pct(p.get("share_f")), p.get("support_f") or 0, p.get("eligible") or 0)
+
+
+def why_kept(p: dict) -> str:
+    sec = p["section"]
+    if sec == "compared":
+        return ROLE_LABEL.get(p.get("role"), p.get("role") or "")
+    if sec == "foundation":
+        return cocite_note(p)
+    if sec == "latest":
+        return latest_note(p)
+    base = "cites the seed" if p.get("route") == "seed" else "builds on %s" % (", ".join(p.get("builds_on") or []) or "-")
+    extra = "; also built on by %s of recent area papers" % pct(p["share_f"]) if p.get("share_f") else ""
+    return "%s; %s%s" % (base, p.get("gate"), extra)
+
+
+def write_briefs(wd: str, seeds: list, papers: list) -> None:
+    lines = ["# Briefs for writing diffs.json", ""]
+    for s in seeds:
+        sp = load_json(os.path.join(wd, s["dir"], "seed.json"), {}) or {}
+        lines += ["Seed: %s (%s)" % (s.get("title"), s.get("year")), "",
+                  "Seed abstract: %s" % (sp.get("abstract") or "(none)"), ""]
+    lines += ["Write diffs.json as {\"<key>\": \"one sentence: why read it - what it contributes and how it differs from "
+              "the seed\"}. Use \"EXCLUDE: <reason>\" to drop an off-topic paper (then re-run `select` to backfill), and "
+              "{\"diff\": \"...\", \"pick\": 1} to put a paper in \"Read these first\".", ""]
+    for p in papers:
+        if p["section"] not in SECTION_LETTER:
+            continue
+        repo = best_repo(p)
+        code = ("%s ★%s%s" % (repo["repo"], human(repo.get("stars")),
+                              ", docs %s/5" % repo["docs"] if repo.get("docs") is not None else "")) if repo else "no code found"
+        why = why_kept(p)
+        if p["section"] == "compared":
+            why = "%s (%s)" % (why, "; ".join(p.get("evidence") or [])[:160])
+        lines.append("## %s | %s (%s) | %s cites | %s | %s | %s" % (
+            p["key"], p["title"], p.get("year"), p.get("citationCount"), SECTION_LABEL[p["section"]], why, code))
+        lines.append(p.get("tldr") or (p.get("abstract") or "")[:700] or "(no abstract available - judge from the title or skim the paper)")
         lines.append("")
     with open(os.path.join(wd, "briefs.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
 
 
-def print_forward_summary(wd: str, papers: list, meta: dict) -> None:
-    main = [p for p in papers if p["bucket"] == "main"]
-    with_code = [p for p in main if code_cell(p.get("code"))[0]]
+def code_brief(p: dict) -> str:
+    repo = best_repo(p)
+    if repo:
+        return "%s ★%s%s" % (repo["repo"], human(repo.get("stars")), " d%s" % repo["docs"] if repo.get("docs") is not None else "")
+    hf = [h for h in (p.get("code") or {}).get("hf") or [] if h.get("verified", True)]
+    return ("HF %s ♥%s" % (hf[0]["id"], hf[0]["likes"])) if hf else "-"
+
+
+def print_select_summary(wd: str, papers: list, meta: dict, diffs: dict) -> None:
+    by = {}
+    for p in papers:
+        by.setdefault(p["section"], []).append(p)
+    kept = [p for p in papers if p["section"] in SECTION_LETTER]
+    co = meta.get("cocitation") or {}
+    widened = sum(1 for p in by.get("follow_up", []) if p.get("route") == "expand")
     print("WORKDIR %s" % wd)
-    print("POOL    %d unique papers seen (%d seed citers, %d from the topic search); %d reference lists checked%s"
+    print("POOL    %d papers screened (%d citing the seeds, %d from the topic search); %d reference lists checked%s"
           % (meta["pool"], meta["seed_citers"], meta["topic_hits"], meta["verified"],
-             (" (%d candidates had no retrievable reference list)" % meta["no_reference_list"])
-             if meta.get("no_reference_list") else ""))
-    print("KEPT    %d papers (%d with code), %d below threshold, %d overflow"
-          % (len(main), len(with_code), sum(p["bucket"] == "below_threshold" for p in papers),
-             sum(p["bucket"] == "overflow" for p in papers)))
+             (" (%d had none)" % meta["no_reference_list"]) if meta.get("no_reference_list") else ""))
+    print("COCITE  backward: %d of %d reference lists (seed%s + compared works); forward: %d recent area papers"
+          % (co.get("backward_have", 0), co.get("backward_set", 0), "s" if len(meta.get("seed_keys") or []) > 1 else "",
+             co.get("area_size", 0)))
+    print("KEPT    %d papers: A1 %d compared · A2 %d foundations · B %d follow-ups%s · C %d latest models; %d also qualified"
+          % (len(kept), len(by.get("compared", [])), len(by.get("foundation", [])), len(by.get("follow_up", [])),
+             " (%d by widening)" % widened if widened else "", len(by.get("latest", [])), len(by.get("also", []))))
+    print("WIDEN   %s: %s" % ("yes" if meta["expand_shown"] else "no", meta["expand_why"]))
     if meta.get("s2_busy_retries"):
         print("NOTE    %d retries against Semantic Scholar's busy keyless pool; an S2_API_KEY makes runs much faster."
               % meta["s2_busy_retries"])
+    if not meta.get("github_token"):
+        print("NOTE    no GitHub token: stars come from Hugging Face's counts and READMEs from raw.githubusercontent.com.")
     if meta.get("failures"):
         print("WARNING requests failed even after retries (%s), so results, especially code links, may be incomplete. "
               "Re-run `forward` when the network is stable; cached responses are reused."
               % ", ".join("%s x%d" % kv for kv in sorted(meta["failures"].items(), key=lambda kv: -kv[1])))
-    print("NEXT    read %s, write %s, then run `report`" % (os.path.join(wd, "briefs.md"), os.path.join(wd, "diffs.json")))
+    missing = [p["key"] for p in kept if p["key"] not in diffs]
+    print("NEXT    read %s and write %s%s, then run `report`" % (
+        os.path.join(wd, "briefs.md"), os.path.join(wd, "diffs.json"),
+        " (%d keys still need a sentence: %s)" % (len(missing), ",".join(missing)) if missing and diffs else ""))
     print("")
-    print("  key       dir  cites   year  code                        title | relation")
-    for p in sorted(main, key=lambda x: -(x.get("citationCount") or 0)):
-        code = (p.get("code") or {})
-        gh = [g for g in code.get("github") or [] if "verify" not in (g.get("source") or "")]
-        hf = [h for h in code.get("hf") or [] if h.get("verified", True)]
-        maybe = [g for g in code.get("github") or [] if "verify" in (g.get("source") or "")]
-        cell = (("%s ★%s" % (gh[0]["repo"], human(gh[0]["stars"]))) if gh else
-                ("HF %s ♥%s" % (hf[0]["id"], hf[0]["likes"])) if hf else
-                ("?%s (unverified)" % maybe[0]["repo"]) if maybe else "-")
-        print("  %-9s %-4s %6s  %-5s %-27s %s | %s" % (p["key"], p["direction"][0].upper(), p.get("citationCount"),
-                                                      p.get("year") or "", cell[:27], (p["title"] or "")[:60], p["relation"][:70]))
+    print("  key       sec  cites   year  code                          title | why kept")
+    for sec in ("compared", "foundation", "follow_up", "latest"):
+        for p in by.get(sec, []):
+            print("  %-9s %-4s %6s  %-5s %-29s %s | %s" % (p["key"], SECTION_LETTER[sec], p.get("citationCount"),
+                                                          p.get("year") or "", code_brief(p)[:29], (p["title"] or "")[:60],
+                                                          why_kept(p)[:80]))
+
+
+def load_diffs(wd: str) -> dict:
+    """diffs.json -> {key: {"text", "exclude", "reason", "pick", "kind"}}. Values are a sentence, "EXCLUDE: reason",
+    or {"diff": "...", "pick": true | <rank>, "exclude": true | "reason", "kind": "data" | "model"}."""
+    raw = load_json(os.path.join(wd, "diffs.json"), {}) or {}
+    out = {}
+    for order, (k, v) in enumerate(raw.items()):
+        if isinstance(v, dict):
+            text = (v.get("diff") or v.get("why") or "").strip()
+            ex = v.get("exclude")
+            pick = v.get("pick")
+            pick = None if pick in (None, False) else (order + 1000 if pick is True else float(pick))
+            kind = {"data": "data", "dataset": "data", "benchmark": "data", "model": "model", "method": "model"}.get(
+                str(v.get("kind") or "").lower())
+            out[k[:8]] = {"text": text, "exclude": bool(ex), "reason": ex if isinstance(ex, str) else text, "pick": pick,
+                          "kind": kind}
+        else:
+            text = (v or "").strip()
+            ex = text.upper().startswith("EXCLUDE")
+            out[k[:8]] = {"text": "" if ex else text, "exclude": ex, "reason": text.split(":", 1)[-1].strip(), "pick": None,
+                          "kind": None}
+    return out
 
 
 # ----------------------------------------------------------------------------- report
@@ -2115,8 +2942,8 @@ def md_escape(text) -> str:
 def code_cell(code: dict | None) -> tuple:
     """-> (verified links md, their stars/likes md, popularity for tie-breaking, unverified links md).
 
-    Only verified links put a paper in "with code": repos linked from the paper or its Hugging Face page, strong
-    GitHub-search matches, and Hugging Face artifacts owned by the same account as that repo.
+    Only verified links count as code: repos linked from the paper or its Hugging Face page, strong GitHub-search
+    matches, and Hugging Face artifacts owned by the same account as that repo.
     """
     code = code or {}
     links, counts, maybe, pop = [], [], [], 0
@@ -2137,126 +2964,399 @@ def code_cell(code: dict | None) -> tuple:
     return "<br>".join(links), "<br>".join(counts), pop, "<br>".join(maybe)
 
 
+def code_md(p: dict) -> str:
+    """One compact cell: the best verified repo with stars and README docs score, a Hugging Face artifact, or an
+    unverified candidate marked as such."""
+    code = p.get("code") or {}
+    repo = best_repo(p)
+    parts = []
+    if repo:
+        docs = " · docs %d/5" % repo["docs"] if repo.get("docs") is not None else ""
+        parts.append("[%s](%s) ★%s%s" % (repo["repo"], repo["url"], human(repo.get("stars")), docs))
+    hf = [h for h in code.get("hf") or [] if h.get("verified", True)]
+    if hf and (not repo or len(parts) < 2):
+        parts.append("🤗 [%s](%s) ♥%s" % (hf[0]["id"], hf[0]["url"], human(hf[0]["likes"])))
+    if not parts:
+        maybe = [g for g in code.get("github") or [] if "verify" in (g.get("source") or "")]
+        if maybe:
+            return "maybe [%s](%s) ★%s (unverified)" % (maybe[0]["repo"], maybe[0]["url"], human(maybe[0]["stars"]))
+        return "—"
+    return "<br>".join(parts)
+
+
+def paper_md(p: dict) -> str:
+    """Title link with the paper's short name in bold ("**LoRA**: Low-Rank ...") so a column scans quickly."""
+    title = md_escape(p.get("title"))
+    name = short_name(p.get("title") or "")
+    if name and title.startswith(md_escape(name)):
+        title = "**%s**%s" % (md_escape(name), title[len(md_escape(name)):])
+    return "[%s](%s)" % (title, p.get("link") or "")
+
+
+def cites_md(p: dict) -> str:
+    """Semantic Scholar's count, linked to a Google Scholar search the reader can click (never queried by the script)."""
+    return "[%s](%s)" % (human(p.get("citationCount") or 0), scholar_link(p.get("title")))
+
+
+VENUE_SHORT = {  # normalized Semantic Scholar venue (without a leading "IEEE" / "IEEE/CVF") -> short name
+    "annual meeting of the association for computational linguistics": "ACL",
+    "conference on empirical methods in natural language processing": "EMNLP",
+    "north american chapter of the association for computational linguistics": "NAACL",
+    "computer vision and pattern recognition": "CVPR",
+    "international conference on computer vision": "ICCV",
+    "european conference on computer vision": "ECCV",
+    "neural information processing systems": "NeurIPS",
+    "international conference on learning representations": "ICLR",
+    "international conference on machine learning": "ICML",
+    "aaai conference on artificial intelligence": "AAAI",
+    "international joint conference on artificial intelligence": "IJCAI",
+    "winter conference on applications of computer vision": "WACV",
+    "international conference on robotics and automation": "ICRA",
+    "conference on robot learning": "CoRL",
+    "arxiv org": "arXiv",
+}
+
+
+def short_venue(venue: str | None) -> str:
+    """Semantic Scholar's long venue names, shortened for the seed line ("Neural Information ..." -> NeurIPS)."""
+    if not venue:
+        return ""
+    return VENUE_SHORT.get(re.sub(r"^ieee (cvf )?", "", norm(venue)), venue)
+
+
+def anchor(heading: str) -> str:
+    return "#" + re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", heading.lower()).strip())
+
+
+def auto_picks(sections: dict, n: int) -> list:
+    """Read-first list without agent picks: the 2 strongest foundation datasets / benchmarks, the 2 strongest compared
+    papers (citations + stars), the 2 best follow-ups and the 2 most-used latest models, then the next best overall."""
+    def strength(p):
+        return math.log10(1 + (p.get("citationCount") or 0)) + 0.5 * math.log10(1 + ((best_repo(p) or {}).get("stars") or 0))
+    groups = [[p for p in sections["foundation"] if p.get("kind") == "data"],  # ranked by co-citation score
+              sorted(sections["compared"], key=lambda p: -strength(p)),
+              sorted(sections["follow_up"], key=lambda p: -(p.get("score") or 0)),
+              sections["latest"]]  # ranked by share
+    picks = [p for group in groups for p in group[:2]]
+    rest = [p for group in groups for p in group[2:]] + [p for p in sections["foundation"] if p.get("kind") != "data"]
+    for p in rest:
+        if len(picks) >= n:
+            break
+        picks.append(p)
+    return picks[:n]
+
+
+def pick_reason(p: dict, seeds_by_key: dict) -> str:
+    multi = len(seeds_by_key) > 1
+    sec = p["section"]
+    if sec == "compared":
+        who = " by %s" % ", ".join(seeds_by_key[k] for k in p.get("seeds") or [] if k in seeds_by_key) if multi else ""
+        return "↩ Compared in the seed%s (%s)." % (who, ROLE_LABEL.get(p.get("role"), p.get("role")))
+    if sec == "foundation":
+        return "↩ Foundation: %s." % cocite_note(p)
+    if sec == "latest":
+        return "↪ Latest model: %s." % latest_note(p)
+    if p.get("route") == "seed":
+        who = " %s" % ", ".join(seeds_by_key[k] for k in p.get("seeds") or [] if k in seeds_by_key) if multi else " the seed"
+        return "↪ Cites%s · %s." % (who, p.get("gate"))
+    return "↪ Builds on %s · %s." % (", ".join((p.get("builds_on") or [])[:3]) or "the compared works", p.get("gate"))
+
+
+def bibtex_for(p: dict) -> str:
+    """Semantic Scholar's BibTeX for the paper (with a url field added), or a minimal entry built from its metadata."""
+    bib = (p.get("bibtex") or "").strip()
+    link = p.get("link") or ""
+    if not bib:
+        authors = p.get("authors") or []
+        last = re.sub(r"[^A-Za-z]", "", (authors[0].split()[-1] if authors else "anon")) or "anon"
+        word = next((w for w in re.findall(r"[A-Za-z]+", p.get("title") or "") if w.lower() not in BASIC_STOPWORDS), "paper")
+        arxiv = (p.get("externalIds") or {}).get("ArXiv")
+        venue = p.get("venue") or ("arXiv preprint arXiv:%s" % arxiv if arxiv else "")
+        bib = "@article{%s%s%s,\n title = {%s},\n author = {%s},\n journal = {%s},\n year = {%s}\n}" % (
+            last.lower(), p.get("year") or "", word.lower(), p.get("title"), " and ".join(authors) or "Unknown",
+            venue, p.get("year") or "")
+    if link and not re.search(r"^\s*url\s*=", bib, re.M | re.I):
+        bib = re.sub(r"\n?\}\s*$", ",\n url = {%s}\n}" % link, bib)
+    return bib
+
+
+def write_bib(path: str, papers: list) -> int:
+    seen, out = set(), []
+    for p in papers:
+        bib = bibtex_for(p)
+        m = re.match(r"\s*@\w+\{([^,]+),", bib)
+        if m:
+            key, n = m.group(1), 2
+            while key in seen:
+                key = "%s%s" % (m.group(1), "abcdefghij"[n - 2] if n < 12 else n)
+                n += 1
+            seen.add(key)
+            bib = bib.replace(m.group(1), key, 1)
+        out.append(bib)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n\n".join(out) + "\n")
+    return len(out)
+
+
 def cmd_report(args) -> None:
     wd = workdir_for(args)
-    seed = load_json(os.path.join(wd, "seed.json"))
+    seeds = load_seeds(wd)
     data = load_json(os.path.join(wd, "candidates.json"))
-    core = load_json(os.path.join(wd, "core.json"), [])
-    if not seed or not data:
-        raise SystemExit("Missing seed.json / candidates.json in %s - run `backward` and `forward` first." % wd)
-    diffs = load_json(os.path.join(wd, "diffs.json"), {}) or {}
-    diffs = {k[:8]: v for k, v in diffs.items()}
-    meta, papers = data["meta"], data["papers"]
-
-    def diff_of(p):
-        d = diffs.get(p["key"])
-        if isinstance(d, dict):
-            return d.get("diff") or "", bool(d.get("exclude"))
-        d = (d or "").strip()
-        return d, d.upper().startswith("EXCLUDE")
-
-    main, excluded = [], []
-    for p in papers:
-        if p["bucket"] != "main":
-            continue
-        d, ex = diff_of(p)
-        (excluded if ex else main).append((p, d))
-
-    def sort_key(item):
-        p = item[0]
-        return (-(p.get("citationCount") or 0), -code_cell(p.get("code"))[2])
-
-    with_code = sorted([x for x in main if code_cell(x[0].get("code"))[0]], key=sort_key)
-    no_code = sorted([x for x in main if not code_cell(x[0].get("code"))[0]], key=sort_key)
-    th = meta["thresholds"]
-    seed_link = paper_link(seed)
-    lines = ["# Forward–backward search: %s" % md_escape(seed.get("title")), ""]
-    lines.append("**Seed:** [%s](%s) — %s, %s %s · %s citations" % (
-        md_escape(seed.get("title")), seed_link, first_author(seed) or "?", seed.get("venue") or "", seed.get("year") or "",
-        human(seed.get("citationCount"))))
-    lines.append("")
-    lines.append("**Paper type:** %s · **Searched:** %s · **Threshold:** ≥%d citations (≥%d if published in the last %d months)"
-                 % (seed.get("paper_type"), meta["generated"], th["min_citations"], th["recent_min_citations"], th["recent_months"]))
-    lines.append("")
-    lines.append("**Kept:** %d papers — %d with code, %d without. Citation counts: Semantic Scholar (Google Scholar is usually higher)."
-                 % (len(main), len(with_code), len(no_code)))
-    lines.append("")
-    groups = {}
-    for c in core:
-        if c.get("include"):
-            groups.setdefault(c["role"], []).append(c)
-    if groups:
-        lines += ["## What the seed compares against", ""]
-        heading = {"baseline": "Baselines", "benchmarked_model": "Benchmarked models", "compared_dataset": "Compared datasets",
-                   "compared_benchmark": "Compared benchmarks", "related": "Closest related work"}
-        for role in ("baseline", "benchmarked_model", "compared_dataset", "compared_benchmark", "related"):
-            items = groups.get(role)
-            if items:
-                names = ", ".join("%s (%s)" % (md_escape(label(i["title"], 60)), i.get("year") or "?") for i in items)
-                lines.append("- **%s:** %s" % (heading[role], names))
-        lines.append("")
-
-    def table(rows, with_code_col):
-        maybe_col = not with_code_col and any(code_cell(p.get("code"))[3] for p, _ in rows)
-        head = ("| # | Paper | Year | Cites | Found via | " + ("Code | ★ / ♥ | " if with_code_col else "")
-                + ("Possible code (unverified) | " if maybe_col else "") + "How it differs from the seed |")
-        sep = "|---:|---|---:|---:|---|" + ("---|---:|" if with_code_col else "") + ("---|" if maybe_col else "") + "---|"
-        out = [head, sep]
-        for i, (p, d) in enumerate(rows, 1):
-            links, counts, _, maybe = code_cell(p.get("code"))
-            paper = "[%s](%s) · [GS](%s)" % (md_escape(p["title"]), p.get("link") or "", scholar_link(p["title"]))
-            via = ("↩ " if p["direction"] == "backward" else "↪ ") + md_escape(p.get("relation"))
-            diff = md_escape(d) or "_(to do)_"
-            cells = [str(i), paper, str(p.get("year") or ""), human(p.get("citationCount")), via]
-            if with_code_col:
-                cells += [links, counts]
-            if maybe_col:
-                cells.append(maybe)
-            out.append("| " + " | ".join(cells + [diff]) + " |")
-        return out
-
-    lines += ["## 1. Influential papers with code", "", "Sorted by citations, then GitHub stars / Hugging Face likes. "
-              "↩ = backward (cited by the seed), ↪ = forward (cites the seed or its comparison set).", ""]
-    lines += table(with_code, True) if with_code else ["_None found._"]
-    lines += ["", "## 2. Influential papers without public code found", ""]
-    lines += table(no_code, False) if no_code else ["_None._"]
-    below = [p for p in papers if p["bucket"] == "below_threshold"]
-    overflow = [p for p in papers if p["bucket"] == "overflow"]
-    if below:
-        lines += ["", "## Appendix A. Directly compared, but below the citation threshold", ""]
-        for p in sorted(below, key=lambda x: -(x.get("citationCount") or 0)):
-            links, counts, _, _ = code_cell(p.get("code"))
-            d, ex = diff_of(p)
-            lines.append("- [%s](%s) (%s) · %s cites · %s%s%s" % (
-                md_escape(p["title"]), p.get("link"), p.get("year"), p.get("citationCount"), md_escape(p.get("relation")),
-                (" · " + links.replace("<br>", ", ")) if links else "", (" — " + md_escape(d)) if d and not ex else ""))
-    if overflow:
-        lines += ["", "## Appendix B. More candidates over the size cap (not reviewed)", ""]
-        for p in sorted(overflow, key=lambda x: -(x.get("citationCount") or 0))[:80]:
-            lines.append("- [%s](%s) (%s) · %s cites · %s" % (md_escape(p["title"]), p.get("link"), p.get("year"),
-                                                             p.get("citationCount"), md_escape(p.get("relation"))))
-    if excluded:
-        lines += ["", "<details><summary>Excluded as off-topic (%d)</summary>" % len(excluded), ""]
-        for p, d in excluded:
-            lines.append("- %s — %s" % (md_escape(p["title"]), md_escape(d.split(":", 1)[-1])))
-        lines += ["", "</details>"]
-    sources = ["the seed's citers (%s)" % human(meta.get("seed_citers")),
-               "the newest %s citers of each core paper" % human(meta.get("cap"))]
-    if meta.get("query"):
-        sources.append("a citation-sorted Semantic Scholar search for %s" % meta["query"])
-    if meta.get("openalex_calls"):
-        sources.append("OpenAlex's most-cited citers")
-    lines += ["", "---", "_Method: backward = the seed's references, with roles read from its comparison tables, related "
-              "work and citation sentences. Forward candidates came from %s; each candidate's reference list was then "
-              "checked, and kept papers cite the seed, or at least 2 core papers, or 1 core paper plus a topic match "
-              "(keywords: %s). Citation counts are Semantic Scholar's as of %s; the GS links open Google Scholar, "
-              "whose counts run higher. Generated by the citation-snowball skill._"
-              % ("; ".join(sources), ", ".join(meta.get("keywords") or []) or "-", meta["generated"])]
+    if not data:
+        raise SystemExit("Missing candidates.json in %s - run `forward` (or `select`) first." % wd)
+    lines, kept, n_bib_papers, todo = render_report(data, seeds, load_diffs(wd), args.read_first)
     out_path = args.out or os.path.join(wd, "report.md")
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
-    todo = sum(1 for p, d in main if not d)
-    print("REPORT  %s  (%d papers: %d with code, %d without; %d still missing a diff)" % (out_path, len(main), len(with_code), len(no_code), todo))
+    bib_note = ""
+    if not args.no_bib:
+        bib_path = os.path.splitext(out_path)[0] + ".bib"
+        bib_note = "; BibTeX for %d papers in %s" % (write_bib(bib_path, n_bib_papers), bib_path)
+    with_code = sum(1 for p in kept if best_repo(p) or code_cell(p.get("code"))[0])
+    print("REPORT  %s  (%d papers, %d with code; %d still missing a sentence%s)"
+          % (out_path, len(kept), with_code, todo, bib_note))
+
+
+def render_report(data: dict, seeds: list, diffs: dict, n_picks: int = 8) -> tuple:
+    """-> (markdown lines, kept papers, papers for the .bib file, papers still missing a sentence)."""
+    meta, papers = data["meta"], data["papers"]
+    multi = len(seeds) > 1
+    seeds_by_key = {s["key"]: label(s.get("title"), 30) for s in seeds}
+
+    def diff_of(p):
+        return diffs.get(p["key"]) or {"text": "", "exclude": False, "reason": "", "pick": None}
+
+    sections = {"compared": [], "foundation": [], "follow_up": [], "latest": [], "related": [], "also": []}
+    excluded = []
+    for p in papers:
+        d = diff_of(p)
+        if d["exclude"]:
+            if p["section"] != "also":
+                excluded.append((p, d["reason"]))
+            continue
+        sections.setdefault(p["section"], []).append(p)
+    kept = sections["compared"] + sections["foundation"] + sections["follow_up"] + sections["latest"]
+    flagged = sorted([(diff_of(p)["pick"], i, p) for i, p in enumerate(kept) if diff_of(p)["pick"] is not None],
+                     key=lambda t: t[:2])
+    picks = [p for _, _, p in flagged] or auto_picks(sections, n_picks)
+
+    def years(rows):
+        ys = sorted(p.get("year") for p in rows if p.get("year"))
+        return ("%s–%s" % (ys[0], ys[-1]) if ys[0] != ys[-1] else str(ys[0])) if ys else "—"
+
+    def has_code(p):
+        return bool(best_repo(p) or code_cell(p.get("code"))[0])
+
+    the_seed = "the seeds" if multi else "the seed"
+    lines = []
+    if multi:
+        lines += ["# Reading map: %s" % " + ".join(md_escape(label(s.get("title"), 30)) for s in seeds), ""]
+    else:
+        lines += ["# Reading map: %s" % md_escape(label(seeds[0].get("title"), 60)), ""]
+    for s in seeds:
+        authors = s.get("authors") or []
+        first = first_author({"authors": authors if authors and isinstance(authors[0], dict) else
+                              [{"name": a} for a in authors]})
+        lines.append("**Seed:** [%s](%s) · %s · %s %s · %s citations · %s paper  " % (
+            md_escape(s.get("title")), paper_link(s), first or "?", md_escape(short_venue(s.get("venue"))),
+            s.get("year") or "", human(s.get("citationCount")), s.get("paper_type")))
+    lines.append("**%d papers to read**, %d with code, picked from %s screened · searched %s · citation counts from "
+                 "Semantic Scholar (click a count for Google Scholar's)" % (
+                     len(kept), sum(1 for p in kept if has_code(p)), "{:,}".format(meta.get("pool") or 0),
+                     meta.get("selected") or meta.get("generated")))
+    lines.append("")
+
+    h_a1 = "A1. What %s compare%s against" % (the_seed, "" if multi else "s")
+    h_a2 = "A2. What the field builds on"
+    h_b = "B. Influential follow-ups"
+    h_c = "C. Latest models to keep an eye on"
+    lines += ["| Section | Papers | With code | Published |", "|---|---:|---:|---|"]
+    lines.append("| [Read these first](#read-these-first) | %d | %d | %s |" % (len(picks), sum(1 for p in picks if has_code(p)), years(picks)))
+    for head, rows in ((h_a1, sections["compared"]), (h_a2, sections["foundation"]), (h_b, sections["follow_up"]),
+                       (h_c, sections["latest"])):
+        lines.append("| [%s](%s) | %d | %d | %s |" % (head, anchor(head), len(rows), sum(1 for p in rows if has_code(p)), years(rows)))
+    lines.append("")
+
+    lines += ["## Read these first", ""]
+    if picks:
+        lines += ["↩ = what %s build%s on · ↪ = newer work" % (the_seed, "" if multi else "s"), ""]
+    else:
+        lines.append("_Nothing to recommend yet._")
+    for i, p in enumerate(picks, 1):
+        repo = best_repo(p)
+        code = (" · [%s](%s) ★%s" % (repo["repo"], repo["url"], human(repo.get("stars")))) if repo else ""
+        lines.append("%d. %s · %s · %s citations%s  " % (i, paper_md(p), p.get("year") or "?", human(p.get("citationCount")), code))
+        text = diff_of(p)["text"]
+        lines.append("   %s%s" % (pick_reason(p, seeds_by_key), (" " + md_escape(text)) if text else ""))
+    lines.append("")
+
+    def table(rows, extra=None):
+        head = "| # | Paper | Year | Cites | Code | " + ("%s | " % extra[0] if extra else "") + "Why read it |"
+        sep = "|--:|---|--:|--:|---|" + ("---|" if extra else "") + "---|"
+        out = [head, sep]
+        for i, p in enumerate(rows, 1):
+            paper = paper_md(p)
+            if p.get("twins"):
+                paper += "<br><sub>also published as %s</sub>" % md_escape("; ".join(p["twins"]))
+            cells = [str(i), paper, str(p.get("year") or ""), cites_md(p), code_md(p)]
+            if extra:
+                cells.append(extra[1](p))
+            cells.append(md_escape(diff_of(p)["text"]) or "_(to do)_")
+            out.append("| " + " | ".join(cells) + " |")
+        return out
+
+    sel = meta["selection"]
+    gates = sel["gates"]
+    co = meta.get("cocitation") or {}
+    n_b = co.get("backward_have") or 0
+    lines += ["## A. Foundations", ""]
+    lines.append("Read these to know the ground %s stand%s on: what %s compare%s against, and what %s and the works "
+                 "%s compare%s against all build on." % (the_seed, "" if multi else "s", the_seed, "" if multi else "s",
+                                                        the_seed, "they" if multi else "it", "" if multi else "s"))
+    lines.append("")
+    lines += ["### " + h_a1, ""]
+    lines.append("Every paper %s compare%s against in %s tables, whatever its citation count: compare with these." % (
+        the_seed, "" if multi else "s", "their" if multi else "its"))
+    lines.append("")
+    by_role = {}
+    for p in sections["compared"]:
+        by_role.setdefault(p.get("role"), []).append(p)
+    heading = {"baseline": "Baselines", "benchmarked_model": "Benchmarked models", "compared_dataset": "Compared datasets",
+               "compared_benchmark": "Compared benchmarks"}
+    compared_by = ("Compared by", lambda p: ", ".join(seeds_by_key.get(k, k) for k in p.get("seeds") or [])) if multi else None
+    for role in TABLE_ROLES:
+        if by_role.get(role):
+            lines += ["**%s (%d)**" % (heading[role], len(by_role[role])), ""] + table(by_role[role], compared_by) + [""]
+    if not sections["compared"]:
+        lines += ["_No comparison papers in the core set. Mark the seed's baselines with `core --role` / `--include`._", ""]
+    if sections["related"]:
+        lines.append("**Closest related work** (discussed, not compared in tables): " + " · ".join(
+            "[%s](%s) (%s)" % (md_escape(label(p.get("title"), 50)), p.get("link") or "", p.get("year") or "?")
+            for p in sections["related"][:12]))
+        lines.append("")
+
+    lines += ["### " + h_a2, ""]
+    lines.append("Papers that %s and %d compared works cite again and again, still cited by recent work in the area, "
+                 "plus older papers that at least %s of recent area papers cite. \"6 of 15\" = cited by 6 of %s and its "
+                 "compared works; \"27%% of recent work\" = the share of the area's recent papers citing it. A paper "
+                 "cited everywhere (COCO, CLIP) ranks below an equally co-cited specialist one." % (
+                     the_seed, max(n_b - len(seeds), 0), pct(COCITE["consensus_share"]), the_seed))
+    lines.append("")
+    data_rows = [p for p in sections["foundation"] if p.get("kind") == "data"]
+    model_rows = [p for p in sections["foundation"] if p.get("kind") != "data"]
+    cited_by = ("Cited by", lambda p: "<br>".join(
+        x for x in ("%d of %d" % (p["k_b"], p.get("n_b") or 0) if (p.get("k_b") or 0) >= 2 else "",
+                    "%s of recent work" % pct(p.get("share_f")) if p.get("share_f") else "") if x) or "—")
+    if data_rows:
+        lines += ["**Datasets and benchmarks (%d)**" % len(data_rows), ""] + table(data_rows, cited_by) + [""]
+    if model_rows:
+        lines += ["**Models and methods (%d)**" % len(model_rows), ""] + table(model_rows, cited_by) + [""]
+    if not sections["foundation"]:
+        lines += ["_No foundations: the seed and its compared works share few references, or none is still cited by "
+                  "recent work._", ""]
+
+    lines += ["## " + h_b, ""]
+    widened = [p for p in sections["follow_up"] if p.get("route") == "expand"]
+    if sections["follow_up"]:
+        lines.append("Papers citing %s, kept for enough citations for their age or a popular, well-documented repo, and "
+                     "for citing what %s build%s on (the same-area check; bars in the footnote). Ranked by a SOTA "
+                     "score: citations and GitHub stars per month, with a bonus for the last %d months." % (
+                         the_seed, the_seed, "" if multi else "s", sel["recent_months"]))
+        if widened:
+            lines.append("")
+            lines.append("Because %s, this section also has %d recent papers on the seed's topic that build on the "
+                         "works it compares against (marked \"builds on\")." % (meta["expand_why"], len(widened)))
+        lines.append("")
+
+        def kept_because(p):
+            if p.get("route") == "seed":
+                base = ("cites " + ", ".join(seeds_by_key.get(k, k) for k in p.get("seeds") or [])) if multi else "cites the seed"
+            else:
+                base = "builds on " + md_escape(", ".join((p.get("builds_on") or [])[:3]) or "the compared works")
+            extra = "<br>used by %s of recent work" % pct(p["share_f"]) if p.get("share_f") else ""
+            return "%s<br>_%s_%s" % (base, md_escape(p.get("gate")), extra)
+        lines += table(sections["follow_up"], ("Kept because", kept_because))
+    else:
+        lines.append("_No paper citing %s passes the influence gate yet (%s citations so far)._" % (
+            the_seed, " + ".join(human(s.get("citationCount")) for s in seeds)))
+    lines.append("")
+
+    lines += ["## " + h_c, ""]
+    lines.append("Papers from the last %d months that many of the area's newest papers build on: each is cited by at "
+                 "least %s of the area papers published after it. They are found from the citing side, so they show "
+                 "up even when Semantic Scholar has no reference list for them (as for SAM 3 and Qwen2.5-VL)." % (
+                     sel["latest_months"], pct(COCITE["latest_share"])))
+    lines.append("")
+    if sections["latest"]:
+        lines += table(sections["latest"], ("Used by", lambda p: "%s of later area papers<br>_%d of %d_" % (
+            pct(p.get("share_f")), p.get("support_f") or 0, p.get("eligible") or 0)))
+    else:
+        lines.append("_None: too few recent papers in the area to tell (%d with reference lists)._" % (co.get("area_size") or 0))
+    lines.append("")
+
+    also = sections["also"][:sel["max_also"]]
+    if also:
+        lines += ["<details><summary>Also qualified, beyond the size caps (%d, not reviewed)</summary>" % len(also), ""]
+        for p in also:
+            lines.append("- %s (%s) · %s · %s" % (paper_md(p), p.get("year") or "?", md_escape(p.get("gate")),
+                                                   "cites the seed" if p.get("route") == "seed" else
+                                                   "builds on " + md_escape(", ".join(p.get("builds_on") or []))))
+        lines += ["", "</details>", ""]
+    if excluded:
+        lines += ["<details><summary>Excluded after review (%d)</summary>" % len(excluded), ""]
+        for p, reason in excluded:
+            lines.append("- %s — %s" % (md_escape(p.get("title")), md_escape(reason)))
+        lines += ["", "</details>", ""]
+
+    def g(name):
+        cites, stars = gates[name]
+        if cites is None:
+            return "nothing (closed)"
+        return "≥%d citations%s" % (cites, " or ★≥%d" % stars if stars else "")
+    area_def = ("papers from the last %d months that cite %s, or cite a compared work and match the topic (keywords: "
+                "%s); %d had reference lists" % (sel["latest_months"], the_seed,
+                                                 md_escape(", ".join(meta.get("keywords") or [])) or "-",
+                                                 co.get("area_size") or 0))
+    old = gates.get("expand.old") or [None, None]
+    lines += ["---", "", "**How this map was made.**", ""]
+    lines.append("- **A1** comes from %s own results and comparison tables (read from the arXiv HTML) and was reviewed "
+                 "by the agent; no citation bar." % ("the seeds'" if multi else "the seed's"))
+    lines.append("- **A2** = papers cited by at least %d of the %d reference lists of %s and its compared works and by "
+                 "at least %s (and %d) of recent area papers, or older papers cited by at least %s of recent area "
+                 "papers; all with at least %d citations, ranked by (backward share + forward share) x log(corpus size "
+                 "/ citations). Recent area = %s." % (
+                     max(COCITE["k_min"], math.ceil(COCITE["k_share"] * n_b)), n_b, the_seed,
+                     pct(COCITE["confirm_share"]), COCITE["confirm_support"], pct(COCITE["consensus_share"]),
+                     COCITE["min_citations"], area_def))
+    lines.append("- **B** = papers citing %s. Kept with %s at any age; %s within %d months; %s within %d months. Stars "
+                 "count only for a verified repo whose README covers at least %d of: setup, usage, training, "
+                 "evaluation, released weights (twice the stars if the README could not be read). Each must also cite "
+                 "one of the %d strongest co-citations of %s and its compared works; a paper whose reference list is "
+                 "not available passes on its citation of %s. When fewer than %d pass, B adds papers that cite a "
+                 "compared work and match the topic, with %s within %d months or %s within %d months (%s); citers of "
+                 "hubs (≥%s citations, e.g. SAM or CLIP) are not searched%s." % (
+                     the_seed, g("seed.any"), g("seed.recent"), sel["recent_months"], g("seed.mid"), sel["mid_months"],
+                     sel["min_docs"], COCITE["coupling_top"], the_seed, the_seed, sel["min_forward"],
+                     g("expand.recent"), sel["recent_months"], g("expand.mid"), sel["mid_months"],
+                     "older papers are left out" if old[0] is None else
+                     "older ones need ≥%d citations and citations of 2 compared works" % old[0],
+                     human(HUB_MIN_CITATIONS),
+                     "" if meta.get("expand_shown") else "; not needed this time: %s" % meta["expand_why"]))
+    lines.append("- **C** = papers from the last %d months cited by at least %s (and %d) of the recent area papers "
+                 "published after them, out of at least %d such papers." % (
+                     sel["latest_months"], pct(COCITE["latest_share"]), COCITE["latest_support"], COCITE["min_eligible"]))
+    if sel.get("min_citations"):
+        lines.append("- A hard floor of ≥%d citations applied to B (stars could not replace it)." % sel["min_citations"])
+    lines.append("- Screened %s papers (%s citing %s%s); %d reference lists checked. Sources: Semantic Scholar "
+                 "(citations, references, counts, BibTeX), arXiv, Hugging Face and GitHub (code, stars, READMEs)%s. "
+                 "Google Scholar is never queried. Generated by citation-snowball %s on %s." % (
+                     "{:,}".format(meta.get("pool") or 0), "{:,}".format(meta.get("seed_citers") or 0), the_seed,
+                     "; topic search %s since %s" % (meta["query"], meta["since"]) if meta.get("query") and meta.get("since") else "",
+                     meta.get("verified") or 0, ", OpenAlex" if meta.get("openalex_calls") else "",
+                     meta.get("version") or VERSION, meta.get("selected") or meta.get("generated")))
+    todo = sum(1 for p in kept if not diff_of(p)["text"])
+    bib_papers = picks + [p for p in kept if p not in picks]
+    return lines, kept, bib_papers, todo
 
 
 def cmd_code(args) -> None:
@@ -2287,6 +3387,7 @@ def probe(url: str, headers: dict | None = None) -> tuple:
 def cmd_doctor(args) -> None:
     """Check the APIs, keys and tools the skill uses, and say what would make runs faster."""
     rows, tips = [], []
+    rows.append(("citation-snowball", VERSION, "this script"))
     rows.append(("python", sys.version.split()[0], "ok" if sys.version_info >= (3, 8) else "needs Python 3.8+"))
     key = s2_key()
     n = 2 if key else 6
@@ -2315,16 +3416,17 @@ def cmd_doctor(args) -> None:
     rows.append(("OpenAlex", ("ok" if code == 200 else str(code)) + (", %s credits left today" % left if left else "")
                  + ("" if os.environ.get("OPENALEX_API_KEY") else " (keyless)"), "optional"))
     code, hdrs = probe("https://huggingface.co/api/papers/2106.09685")
-    rows.append(("Hugging Face", "ok" if code == 200 else str(code), "code links, likes"))
+    rows.append(("Hugging Face", "ok" if code == 200 else str(code), "code links, likes, star probe"))
     token = github_token()
     if token:
         code, hdrs = probe("https://api.github.com/rate_limit", {"Authorization": "bearer " + token})
-        rows.append(("GitHub", "token found; %s" % ("ok" if code == 200 else code), "stars"))
+        rows.append(("GitHub", "token found; %s" % ("ok" if code == 200 else code), "stars, READMEs"))
     else:
         code, hdrs = probe("https://api.github.com/rate_limit")
-        rows.append(("GitHub", "no token (60 requests/hour)", "stars"))
-        tips.append("No GitHub token: star counts come from Hugging Face where possible, else at most 55 repos per run. "
-                    "`gh auth login` (or GH_TOKEN) lifts that.")
+        rows.append(("GitHub", "no token (60 requests/hour)", "stars, READMEs"))
+        tips.append("No GitHub token: stars come from Hugging Face's counts (sometimes stale) and READMEs from "
+                    "raw.githubusercontent.com, so the stars route of the influence gate is less reliable. "
+                    "`gh auth login` (or GH_TOKEN) fixes that.")
     rows.append(("pdftotext", "found" if shutil.which("pdftotext") else "not found", "optional, for non-arXiv PDFs"))
     cache = writable_dir(args.cache_dir) if args.cache_dir else None
     rows.append(("cache dir", cache or "none (not writable)", "HTTP cache shared across runs"))
@@ -2335,6 +3437,49 @@ def cmd_doctor(args) -> None:
         print("")
         for tip in tips:
             print("TIP  " + tip)
+
+
+def add_selection_args(p, defaults: bool) -> None:
+    """Gate and cap flags shared by `forward` and `select` (`select` falls back to what `forward` used)."""
+    d = SELECT_DEFAULTS if defaults else {k: None for k in SELECT_DEFAULTS}
+    note = "" if defaults else " (default: what `forward` used)"
+    p.add_argument("--min-forward", type=int, default=d["min_forward"],
+                   help="widen B to the compared works' citers when fewer papers citing the seed pass (default 8)" + note)
+    p.add_argument("--max-follow-ups", type=int, default=d["max_follow_ups"],
+                   help="max papers in section B (default 15)" + note)
+    p.add_argument("--max-foundations", type=int, default=d["max_foundations"],
+                   help="max datasets/benchmarks, and max models/methods, in section A2 (default 6 each)" + note)
+    p.add_argument("--max-latest", type=int, default=d["max_latest"],
+                   help="max papers in section C (default 8)" + note)
+    p.add_argument("--latest-months", type=int, default=d["latest_months"],
+                   help="how recent section C's models and the area's papers are, in months (default 30)" + note)
+    p.add_argument("--min-coupling", type=int, default=d["min_coupling"],
+                   help="same-area check: how many of the 30 strongest co-citations a follow-up must cite (default 1; "
+                        "0 turns it off)" + note)
+    p.add_argument("--min-area", type=int, default=d["min_area"],
+                   help="also widen when fewer recent papers cite the seed, so section C has enough to go on "
+                        "(default 30)" + note)
+    p.add_argument("--max-also", type=int, default=d["max_also"],
+                   help="max gate passers listed beyond the caps (default 20)" + note)
+    p.add_argument("--expand", choices=["auto", "always", "never"], default=d["expand"],
+                   help="widening B: auto = only when it is short (default)" + note)
+    p.add_argument("--gate", action="append", metavar="ROUTE.BRACKET=CITES[,STARS]",
+                   help="override one gate, e.g. seed.recent=10,100 or expand.mid=80,- (repeatable). Gates: %s"
+                        % ", ".join("%s=%s" % (k, ",".join("-" if x is None else str(x) for x in v)) for k, v in GATES.items()))
+    p.add_argument("--min-citations", type=int, default=d["min_citations"],
+                   help="hard citation floor for section B; also turns the stars routes off (default none)" + note)
+    p.add_argument("--min-docs", type=int, default=d["min_docs"],
+                   help="README docs score (0-5) a repo needs for the stars routes (default 4)" + note)
+    p.add_argument("--recent-months", type=int, default=d["recent_months"],
+                   help="age of the 'recent' bracket in months (default 12)" + note)
+    p.add_argument("--mid-months", type=int, default=d["mid_months"],
+                   help="age of the 'mid' bracket in months (default 24)" + note)
+    # 1.2 flags, kept (deprecated) so old commands still run
+    p.add_argument("--max-forward", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--max-backward", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--recent-min-citations", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--no-code", action="store_true", help="skip the GitHub / Hugging Face lookup")
+    p.add_argument("--no-github-search", action="store_true", help="only use repos linked from the paper itself")
 
 
 def main(argv=None) -> None:
@@ -2354,10 +3499,12 @@ def main(argv=None) -> None:
     p.add_argument("seed")
     p.set_defaults(func=cmd_resolve)
 
-    p = sub.add_parser("backward", parents=[common], help="resolve seed, digest full text, fetch references, propose core set")
-    p.add_argument("seed")
-    p.add_argument("--workdir", help="default: ./fbsearch-<title-slug>")
-    p.add_argument("--type", choices=["method", "dataset", "benchmark", "mixed"], help="override the auto-guessed paper type")
+    p = sub.add_parser("backward", parents=[common],
+                       help="resolve the seed(s), digest full text, fetch references, propose the core set")
+    p.add_argument("seed", nargs="+", help="one or more seeds; extra seeds are added to the same workdir")
+    p.add_argument("--workdir", help="default: ./fbsearch-<first-title-slug>[-and-N-more]")
+    p.add_argument("--type", choices=["method", "dataset", "benchmark", "mixed"],
+                   help="override the auto-guessed paper type (applies to every seed given)")
     p.add_argument("--max-core", type=int, default=30, help="max core papers marked include=true (default 30)")
     p.add_argument("--max-bib-lookups", type=int, default=25,
                    help="max bibliography titles to look up when Semantic Scholar lacks references (default 25)")
@@ -2373,33 +3520,43 @@ def main(argv=None) -> None:
     p.add_argument("--all", action="store_true", help="list every reference, including background ones")
     p.set_defaults(func=cmd_core)
 
-    p = sub.add_parser("forward", parents=[common], help="gather and verify citing papers, thresholds, code links")
+    p = sub.add_parser("forward", parents=[common],
+                       help="co-citation, citers of the seeds (B, widened when short), the area's recent papers; then select")
     p.add_argument("--workdir", required=True, help="the WORKDIR printed by `backward`")
-    p.add_argument("--query", help='Semantic Scholar boolean query for the topic search, e.g. \'"interactive '
+    p.add_argument("--query", help='Semantic Scholar boolean query for the widening topic search, e.g. \'"interactive '
                                    'segmentation" | "part segmentation"\' (default: built from --keywords)')
-    p.add_argument("--keywords", help="comma-separated topic phrases for relevance (default: words of the seed title)")
-    p.add_argument("--min-citations", type=int, default=30, help="citation threshold (default 30)")
-    p.add_argument("--recent-months", type=int, default=18,
-                   help="papers published within this many months use --recent-min-citations (default 18)")
-    p.add_argument("--recent-min-citations", type=int, default=10, help="threshold for recent papers (default 10)")
-    p.add_argument("--seed-cap", type=int, help="max citers of the seed (default 3000 without an S2 key, 9999 with)")
-    p.add_argument("--cap", type=int, help="max newest citers per core paper (default 1000 without an S2 key, 3000 with)")
+    p.add_argument("--keywords", help="comma-separated phrases that define the seed's topic: widening keeps only papers "
+                                      "matching one (in the title, or a multi-word phrase in the abstract) or found by "
+                                      "the topic search. Prefer specific multi-word phrases (default: words of the seed "
+                                      "titles)")
+    p.add_argument("--seed-cap", type=int, help="max citers per seed (default 3000 without an S2 key, 9999 with)")
+    p.add_argument("--cap", type=int, help="max newest citers per compared work when widening (default 1000 without an S2 "
+                                           "key, 3000 with)")
     p.add_argument("--topic-limit", type=int, default=1000, help="max papers from the topic search (default 1000)")
-    p.add_argument("--no-topic-search", action="store_true", help="skip the citation-sorted topic search")
+    p.add_argument("--no-topic-search", action="store_true", help="skip the widening topic search")
     p.add_argument("--verify-cap", type=int, default=3000,
                    help="max candidates whose reference lists are checked, most cited first (default 3000)")
-    p.add_argument("--max-backward", type=int, default=30, help="max backward papers in the report (default 30)")
-    p.add_argument("--max-forward", type=int, default=60,
-                   help="max forward papers in the report, shared across lineages (default 60)")
+    p.add_argument("--area-cap", type=int,
+                   help="max recent area papers whose reference lists are read for co-citation (default 1000 with an S2 "
+                        "key, 400 without)")
+    p.add_argument("--probe-cap", type=int, default=300,
+                   help="max papers probed for GitHub stars in each probe step, fastest-rising first (default 300)")
     p.add_argument("--openalex-budget", type=int, default=40,
                    help="max billable OpenAlex calls for most-cited citers of partially fetched papers (0 = off)")
-    p.add_argument("--no-code", action="store_true", help="skip the GitHub / Hugging Face lookup")
-    p.add_argument("--no-github-search", action="store_true", help="only use repos linked from the paper itself")
+    add_selection_args(p, defaults=True)
     p.set_defaults(func=cmd_forward)
 
-    p = sub.add_parser("report", help="render report.md from candidates.json + diffs.json")
+    p = sub.add_parser("select", parents=[common],
+                       help="re-apply gates and caps to pool.json without re-searching (e.g. after EXCLUDEs)")
     p.add_argument("--workdir", required=True, help="the WORKDIR printed by `backward`")
-    p.add_argument("--out", help="output path (default: <workdir>/report.md)")
+    add_selection_args(p, defaults=False)
+    p.set_defaults(func=cmd_select)
+
+    p = sub.add_parser("report", help="render report.md (+ references .bib) from candidates.json + diffs.json")
+    p.add_argument("--workdir", required=True, help="the WORKDIR printed by `backward`")
+    p.add_argument("--out", help="output path (default: <workdir>/report.md); the .bib file goes next to it")
+    p.add_argument("--read-first", type=int, default=8, help="papers in 'Read these first' without agent picks (default 8)")
+    p.add_argument("--no-bib", action="store_true", help="do not write the BibTeX file")
     p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("code", parents=[common], help="debug: find code for papers (arXiv ids, DOIs or S2 ids)")

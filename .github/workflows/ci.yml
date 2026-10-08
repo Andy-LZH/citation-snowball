@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.8"  # the oldest supported version
+            os: ubuntu-22.04
+          - python-version: "3.13"
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python -m py_compile scripts/fbsearch.py
+      - name: Unit tests (offline, standard library only)
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke test
+        run: |
+          python scripts/fbsearch.py --version
+          python scripts/fbsearch.py forward --help > /dev/null
+          python scripts/fbsearch.py select --help > /dev/null

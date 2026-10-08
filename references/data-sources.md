@@ -15,23 +15,37 @@ Contents:
 
 ## 1. Semantic Scholar (primary)
 
-The Graph API (`https://api.semanticscholar.org/graph/v1`) supplies the seed, its references (with citation contexts
-and intents), citers, citation counts, abstracts and TL;DRs.
+The Graph API (`https://api.semanticscholar.org/graph/v1`) supplies:
+
+- the seed and its references, with citation contexts and intents;
+- citers and citation counts;
+- abstracts and TL;DRs;
+- BibTeX for the kept papers.
 
 - **Keyless access** shares one rate-limited pool with every other keyless user. At busy times most requests get
   HTTP 429; one check on 2026-10-06 saw 1 of 12 requests succeed. The script retries each request with 1-3 s jitter
   for up to `FBS_S2_PATIENCE` seconds (default 900), so keyless runs work but can take 5-20 minutes.
 - **With a key** (`S2_API_KEY`, free from https://www.semanticscholar.org/product/api#api-key-form), requests are
-  rate limited to about 1 per second for that key alone. The script paces itself at 1.1 s.
-- **Citers are returned newest first**, and `offset + limit` must stay below 10,000. See methodology section 4 for how
-  the script compensates.
+  rate limited to about 1 per second for that key alone. The script paces itself at 1.1 s. An occasional 429 still
+  happens with a key; the script backs off and retries it ("HTTP 429 ... retrying in 2s" is harmless).
+- **Citers are returned newest first**, and `offset + limit` must stay below 10,000. Widening wants exactly the
+  newest citers, and the topic search and OpenAlex cover older influential ones (methodology section 9).
+- **Some big papers have no reference list.** SAM 3 (1,162 citations), Qwen2-VL and Qwen2.5-VL (6,110) have
+  `referenceCount: 0` (checked 2026-10-08), so they never appear as citers of anything. Section C finds them from the
+  citing side, by counting what recent papers in the area cite (methodology section 8).
 - Endpoints used:
   - `paper/{id}` (seed)
-  - `paper/{id}/references` (contexts, intents, isInfluential)
+  - `paper/{id}/references` (contexts, intents, isInfluential): the seed's references, and the reference lists
+    of the seeds and compared works with their citation sentences, for section A2's counts and its dataset labels
   - `paper/{id}/citations`
-  - `paper/batch` (up to 500 ids; also used with `references.paperId` to fetch full reference lists for
-    verification)
-  - `paper/search/bulk` (boolean query, `sort=citationCount:desc`, `minCitationCount`)
+  - `paper/batch`, used three ways:
+    - up to 500 ids at a time;
+    - with `references.paperId` for the full reference lists used in verification and in the recent area's
+      co-citation counts (up to 1,000 papers);
+    - with `abstract` to check widening's topic match and to tell datasets from models, and with `citationStyles`
+      for the BibTeX of kept papers.
+  - `paper/search/bulk`: widening's topic search, with a boolean query, `sort=citationCount:desc`,
+    `minCitationCount` and `publicationDateOrYear=<30 months ago>:`.
   - `paper/search/match` (title match)
   - `paper/search` (seed disambiguation)
 - Identifier prefixes accepted for seeds: `ARXIV:`, `DOI:`, `CorpusId:`, `ACL:`, `PMID:`, `PMCID:`, `MAG:`, `URL:`,
@@ -52,17 +66,25 @@ and intents), citers, citation counts, abstracts and TL;DRs.
 
 - `https://huggingface.co/api/papers/{arxiv_id}`: the paper page. `githubRepo` and `githubStars` give the
   repository, linked by the authors or detected automatically. This is the most reliable code link and replaces
-  Papers with Code, which shut down in 2025.
-- `https://huggingface.co/api/{models|datasets|spaces}?filter=arxiv:{id}&sort=likes`: artifacts tagged with the
-  paper. The most-liked artifact of each kind is kept if its owner matches the paper's GitHub owner (verified) or its
-  name contains the paper's short name (unverified). Likes are shown as ♥.
+  Papers with Code, which shut down in 2025. It is also the cheap first step of the **stars probe** that runs before
+  selection.
+- `https://huggingface.co/api/{models|datasets|spaces}?filter=arxiv:{id}&sort=likes`: artifacts tagged with the paper.
+  - Any model card can cite a paper: Microsoft's Magma-8B is tagged with Set-of-Mark's arXiv id. So an artifact
+    counts only if its id contains the paper's short name or its repo's name, or its tags cite no other arXiv paper.
+  - It is verified when its owner also owns the paper's verified GitHub repo, and unverified otherwise.
+  - The most-liked artifact of each kind is kept. Likes are shown as ♥.
 - No key needed; limits are generous.
 
 ## 4. GitHub
 
-- Star counts come from GraphQL (40 repos per query) when a token is available: `GH_TOKEN`, then `GITHUB_TOKEN`,
-  then `gh auth token`. Without a token, REST allows 60 requests per hour: the script queries up to 55 repos and
-  otherwise uses Hugging Face's `githubStars`.
+- **Stars.** With a token, star counts come from GraphQL, 40 repos per query, together with `createdAt` (for stars
+  per month), `pushedAt` and the description. The token is `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`.
+  Without one, REST allows 60 requests per hour: the script queries up to 55 repos, and the stars probe uses
+  Hugging Face's `githubStars` only.
+- **READMEs** for the docs score come from `repos/{repo}/readme` (raw) with a token, and from
+  `raw.githubusercontent.com/{repo}/HEAD/README.md` (no quota) without one. The score gives one point each for setup,
+  usage, training, evaluation and released weights. A check counts when a README heading matches, or the text matches
+  twice. It was calibrated on 72 repos: most maintained ML repos score 4-5, and a stub README scores 0-1.
 - Repo-link priority:
   1. a repo the authors linked on the paper's Hugging Face page;
   2. links in the arXiv comment or abstract (an abstract can also link a dependency, hence the lower rank);
@@ -70,18 +92,29 @@ and intents), citers, citation counts, abstracts and TL;DRs.
      sometimes picks a repo that merely cites the paper.
 - Fallback for papers with no linked repo (at most 40 searches per run, token required):
   1. a repo whose name contains the paper's short name (e.g. "LoRA");
-  2. a repo whose README contains the exact title and whose name or description matches it. Awesome lists, paper
-     lists, surveys and course notes are skipped.
-  This finds e.g. facebookresearch/segment-anything and KaiyangZhou/CoOp, which neither Hugging Face nor arXiv link.
+  2. a repo whose README contains the exact title and whose name or description matches it. A description that
+     names the paper's short name also counts: MiniGPT-v2 lives in Vision-CAIR/MiniGPT-4, "Open-sourced codes for
+     MiniGPT-4 and MiniGPT-v2". Awesome lists, paper lists ("papers", not "the paper"), surveys and course notes are
+     skipped.
+
+  This finds repos that neither Hugging Face nor arXiv link, for example:
+  - facebookresearch/segment-anything;
+  - KaiyangZhou/CoOp;
+  - UX-Decoder/Segment-Everything-Everywhere-All-At-Once.
 - **Verified vs unverified.** Repos from the paper or its Hugging Face page count as verified, and so do strong
   search matches. So do Hugging Face artifacts owned by the same account as the verified repo. Weak search matches,
-  and Hugging Face artifacts matched only by name (often community ports), are **unverified**. They appear in a
-  "Possible code (unverified)" column and do not put a paper in the "with code" section.
+  and Hugging Face artifacts not owned by the repo's owner (often community ports), are **unverified**. They appear as
+  "maybe ... (unverified)" in the code column when nothing verified exists, and never count toward the gate's stars
+  route.
 
 ## 5. OpenAlex (optional)
 
-Used for one job: the most-cited citers of a core paper whose citers were only partly fetched
-(`filter=cites:W...,cited_by_count:>N&sort=cited_by_count:desc`, 100 per call).
+Used for one job: the most-cited citers of a paper whose citers were only partly fetched
+(`filter=cites:W...,cited_by_count:>N&sort=cited_by_count:desc`, 100 per call). There are two cases:
+
+- route B: a seed with more citers than `--seed-cap`;
+- widening: a compared work with more citers than `--cap`. Here the filter adds `from_publication_date:<30 months ago>`,
+  so the hits are recent.
 
 - Pricing in 2026: singleton GETs are free, list/filter calls cost 1 credit, searches 10. Keyless callers get 1,000
   credits per day, shared per IP address; a free key (`OPENALEX_API_KEY`) gives 10,000. The script spends at most
