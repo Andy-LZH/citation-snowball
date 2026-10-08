@@ -1,166 +1,39 @@
 # citation-snowball
 
 [![CI](https://github.com/Andy-LZH/citation-snowball/actions/workflows/ci.yml/badge.svg)](https://github.com/Andy-LZH/citation-snowball/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-1.4.0-blue)
+[![release](https://img.shields.io/github/v/release/Andy-LZH/citation-snowball)](https://github.com/Andy-LZH/citation-snowball/releases)
 ![python](https://img.shields.io/badge/python-3.8%2B%20·%20stdlib%20only-informational)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-An [Agent Skill](https://agentskills.io) that turns a paper you like into a **short reading map**:
+An [Agent Skill](https://agentskills.io) for Claude Code, Codex and GitHub Copilot. It turns a paper you like into a
+short reading map, with code and BibTeX.
 
-- what it compares against;
-- the datasets and models it and those works all build on;
-- who influential has built on it;
-- which new models recent work in its area relies on.
+## Prerequisites
 
-Every paper comes with code, stars and one line on why to read it. You also get a "read these first" list and a
-BibTeX file.
+**Required:**
 
-Works with **Claude Code**, **OpenAI Codex** and **GitHub Copilot** (VS Code and Copilot CLI), and any other agent
-that supports `SKILL.md` skills.
+- An agent: Claude Code, Codex, GitHub Copilot (Copilot CLI needs version 1.0.11 or later) or claude.ai.
+- Python 3.8 or later. The skill uses only the standard library, so there is nothing to `pip install`.
+- Internet access.
 
-> **New in 1.3:** a reading map instead of a long list. Version 1.2 kept every influential paper it found: for one
-> 2025 seed, 81 papers plus 641 overflow candidates. Version 1.3 gives 45 papers for the same seed:
-> - 14 it compares against;
-> - 12 foundations it and those works cite;
-> - 15 influential follow-ups;
-> - 4 latest models.
->
-> 8 of them are in "read these first". Details in the [changelog](CHANGELOG.md).
+**Recommended: a free Semantic Scholar API key.** The skill works without one, but requests then share a public pool
+that is often busy, so a run takes 5-20 minutes instead of one or two.
 
-## What you get
+1. Request a key with [Semantic Scholar's API key form](https://www.semanticscholar.org/product/api#api-key-form).
+2. Add it to your shell profile, then restart your agent:
 
-An excerpt from a [real map](examples/instructpart.md) for **InstructPart** (ACL 2025), a benchmark for
-task-oriented part segmentation:
+   ```sh
+   echo 'export S2_API_KEY=your-key' >> ~/.zshrc    # bash: ~/.bashrc
+   ```
 
-> ## Read these first
->
-> ↩ = what the seed builds on · ↪ = newer work
->
-> 1. [**LISA**: Reasoning Segmentation via Large Language Model](https://arxiv.org/abs/2308.00692) · 2023 · 1.1k citations · [JIA-Lab-research/LISA](https://github.com/JIA-Lab-research/LISA) ★2.7k  
->    ↩ Compared in the seed (benchmarked model). Defines reasoning segmentation and the [SEG]-token MLLM that the seed finds strongest zero-shot and builds its baseline on; it reasons about whole objects, not task-relevant parts.
-> 2. [Scene Parsing through ADE20K Dataset](https://doi.org/10.1109/CVPR.2017.544) · 2017 · 4.1k citations · [CSAILVision/semantic-segmentation-pytorch](https://github.com/CSAILVision/semantic-segmentation-pytorch) ★5.1k  
->    ↩ Foundation: cited by 6 of 15 (seed + compared works) · 14% of recent area papers. Scene parsing dataset with object and part annotations over 150 categories; the standard semantic-segmentation benchmark the compared open-vocabulary models report on, at object rather than task level.
-> 3. [Generation and Comprehension of Unambiguous Object Descriptions](https://arxiv.org/abs/1511.02283) · 2015 · 1.8k citations  
->    ↩ Foundation: cited by 8 of 15 (seed + compared works) · 23% of recent area papers. Introduces RefCOCOg, longer referring expressions over COCO images, with a joint generation-comprehension model; the object-level referring benchmark behind most compared grounding models, where the seed's queries name task-relevant parts.
->
-> …
->
-> 7. [**SAM 3**: Segment Anything with Concepts](https://arxiv.org/abs/2511.16719) · 2025 · 1.2k citations · [facebookresearch/sam3](https://github.com/facebookresearch/sam3) ★12k  
->    ↪ Latest model: cited by 24% of the area's papers since it appeared (23 of 94). Segments every instance of a concept given a short noun phrase or image exemplar; the model SAM3-I builds on, and the strongest new prompt-to-mask baseline to test on part instructions.
-> 8. [**Qwen2.5-VL** Technical Report](https://arxiv.org/abs/2502.13923) · 2025 · 6.1k citations · [QwenLM/Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) ★20k  
->    ↪ Latest model: cited by 23% of the area's papers since it appeared (43 of 188). Qwen vision-language model that grounds with boxes and points in absolute coordinates; the base MLLM of Seg-Zero, Seg-R1 and other 2025 RL reasoning segmenters.
->
-> ### A2. What the field builds on
->
-> _(datasets and benchmarks: rows 1-2 and 5 of 6; citation links omitted)_
->
-> | # | Paper | Year | Cites | Code | Cited by | Why read it |
-> |--:|---|--:|--:|---|---|---|
-> | 1 | [Generation and Comprehension of Unambiguous Object Descriptions](https://arxiv.org/abs/1511.02283) | 2015 | 1.8k | — | 8 of 15<br>23% of recent work | Introduces RefCOCOg, longer referring expressions over COCO images, with a joint generation-comprehension model; the object-level referring benchmark behind most compared grounding models, where the seed's queries name task-relevant parts. |
-> | 2 | [**Microsoft COCO**: Common Objects in Context](https://arxiv.org/abs/1405.0312) | 2014 | 56k | — | 11 of 15<br>21% of recent work | COCO's images and instance masks underlie most datasets here (the RefCOCO family, PACO's LVIS split); object categories only, with no parts or instructions. |
-> | 5 | [Scene Parsing through ADE20K Dataset](https://doi.org/10.1109/CVPR.2017.544)<br><sub>also published as Semantic Understanding of Scenes Through the ADE20K Dataset</sub> | 2017 | 4.1k | [CSAILVision/semantic-segmentation-pytorch](https://github.com/CSAILVision/semantic-segmentation-pytorch) ★5.1k · docs 5/5 | 6 of 15<br>14% of recent work | Scene parsing dataset with object and part annotations over 150 categories; the standard semantic-segmentation benchmark the compared open-vocabulary models report on, at object rather than task level. |
->
-> ## C. Latest models to keep an eye on
->
-> _(all 4 rows; citation links omitted)_
->
-> | # | Paper | Year | Cites | Code | Used by | Why read it |
-> |--:|---|--:|--:|---|---|---|
-> | 1 | [**SAM 2**: Segment Anything in Images and Videos](https://arxiv.org/abs/2408.00714) | 2024 | 4.5k | [facebookresearch/sam2](https://github.com/facebookresearch/sam2) ★20k · docs 5/5 | 33% of later area papers<br>_77 of 231_ | Extends SAM to video with a streaming memory; the default mask decoder of 2025 reasoning-segmentation follow-ups such as Sa2VA and Seg-Zero. |
-> | 2 | [**Qwen3-VL** Technical Report](https://arxiv.org/abs/2511.21631) | 2025 | 2.6k | [QwenLM/Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) ★20k · docs 5/5 | 25% of later area papers<br>_23 of 92_ | The newest Qwen vision-language family, with box and point grounding; the next base MLLM to benchmark on part instructions, as the seed did with its 2023 MLLMs. |
-> | 3 | [**SAM 3**: Segment Anything with Concepts](https://arxiv.org/abs/2511.16719) | 2025 | 1.2k | [facebookresearch/sam3](https://github.com/facebookresearch/sam3) ★12k · docs 5/5 | 24% of later area papers<br>_23 of 94_ | Segments every instance of a concept given a short noun phrase or image exemplar; the model SAM3-I builds on, and the strongest new prompt-to-mask baseline to test on part instructions. |
-> | 4 | [**Qwen2.5-VL** Technical Report](https://arxiv.org/abs/2502.13923) | 2025 | 6.1k | [QwenLM/Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) ★20k · docs 5/5 | 23% of later area papers<br>_43 of 188_ | Qwen vision-language model that grounds with boxes and points in absolute coordinates; the base MLLM of Seg-Zero, Seg-R1 and other 2025 RL reasoning segmenters. |
+**Optional: a GitHub login,** for accurate stars and README checks. Run `gh auth login` with the
+[GitHub CLI](https://cli.github.com), or set `GH_TOKEN`. Without one, stars come from Hugging Face's cached counts.
 
-The full map also has:
-
-- an at-a-glance table;
-- A1, the 14 models and datasets the seed compares against;
-- A2's six models and methods (CLIP, SAM, LLaVA, …);
-- section B, 15 follow-ups: 2 cite the seed, and 13 recent ones build on its compared works;
-- a collapsed list of the papers that also qualified;
-- a footnote with the exact bars it used.
-
-In the full report each citation count links to a Google Scholar search, so you can check it.
-
-## How it decides
-
-The seed is assumed to be good. So what it compares against is worth knowing, what it and those works all cite is the
-field's foundation, and the forward search keeps only influential work in the same area.
-
-```mermaid
-flowchart LR
-    S["Seed paper(s)"] --> T["Its results and<br/>comparison tables"]
-    T --> A1["A1. What it compares against<br/>(no citation bar)"]
-    T --> BC["Reference lists of the seed<br/>and its compared works"]
-    BC --> A2["A2. What the field builds on<br/>(co-cited, still used)"]
-    S --> F["Papers citing the seed<br/>(widened to on-topic citers of A1<br/>when fewer than 8 qualify)"]
-    F --> G{"Influence gate +<br/>same-area check"}
-    G --> B["B. Influential follow-ups<br/>(up to 15, SOTA score)"]
-    F --> AR["Recent area papers:<br/>what do they cite?"]
-    AR --> C["C. Latest models<br/>(cited by ≥15% of later papers)"]
-    AR -. confirms .-> A2
-    A1 --> R["Reading map:<br/>read-first list, tables, BibTeX"]
-    A2 --> R
-    B --> R
-    C --> R
-```
-
-**Co-citation (A2 and C).** The script reads the reference lists of the seed and its compared works, and of up to
-1,000 recent papers in the area (the last 30 months).
-
-- **A2:** a paper cited by at least 20% of the seed and compared works, and still cited by recent work, is a
-  foundation. So is an older paper a quarter of recent work cites. Datasets and benchmarks come first, then models
-  and methods.
-- **C:** a paper from the last 30 months cited by at least 15% of the area papers published after it is a latest
-  model. This is how the map reaches models no citation search can: Semantic Scholar has no reference list for SAM 3
-  or Qwen2.5-VL, so they never show up as citers, but a quarter of InstructPart's recent area builds on them.
-
-**The influence gate (B).** A follow-up is kept when it has enough citations for its age, *or* enough GitHub stars
-on a verified repo whose README documents the implementation. The README check gives one point each for setup,
-usage, training, evaluation and released weights, and needs 4 of 5. Counts are Semantic Scholar's.
-
-| Follow-up | Any age | Published ≤ 12 months ago | 12-24 months | Older |
-|---|---|---|---|---|
-| cites the seed | ≥50 citations, or ★≥1000 | ≥10 citations, or ★≥100 | ≥25 citations, or ★≥250 | (any-age bar) |
-| widening: cites a compared work, on topic | - | ≥20 citations, or ★≥150 | ≥40 citations, or ★≥250 | left out |
-
-Every follow-up must also cite one of the field's 30 strongest co-citations. That same-area check keeps out papers
-that cite the seed in passing. Follow-ups are ranked by a **SOTA score**: citations per month plus half the GitHub
-stars per month (log scale), +0.5 for the last 12 months, -0.5 for surveys, with at most one survey per section.
-
-When fewer than 8 papers citing the seed qualify, B widens to recent, on-topic papers citing the compared works. It
-skips the citers of hubs such as SAM or CLIP, and balances its slots across the compared works. Every bar is a flag
-(`--gate seed.recent=5,100`, `--min-citations 100`, `--expand always`, `--latest-months 36`, ...); see
-[`references/methodology.md`](references/methodology.md).
-
-The agent supplies judgment at three points:
-
-- confirming the comparison set (A1);
-- choosing keywords that define the seed's topic;
-- writing the one-line reasons, the read-first picks and any dataset/model label fixes.
-
-A helper script does all the API work.
+To check your setup, ask your agent to run the skill's `doctor` command.
 
 ## Install
 
-**Claude Code**
-
-```sh
-git clone https://github.com/Andy-LZH/citation-snowball ~/.claude/skills/citation-snowball
-```
-
-**Claude Code + Codex + Copilot**, with one shared copy:
-
-```sh
-git clone https://github.com/Andy-LZH/citation-snowball ~/.agents/skills/citation-snowball
-ln -s ~/.agents/skills/citation-snowball ~/.claude/skills/citation-snowball
-```
-
-- Codex and VS Code Copilot read `~/.agents/skills` directly.
-- Copilot CLI needs version 1.0.11 or later.
-- Codex sandboxes network access by default; approve it when the skill runs.
-
-**Claude Code, as a plugin.** This is the route that can update itself:
+**Claude Code** (recommended):
 
 ```
 /plugin marketplace add Andy-LZH/citation-snowball
@@ -169,113 +42,92 @@ ln -s ~/.agents/skills/citation-snowball ~/.claude/skills/citation-snowball
 
 - On Claude Code 2.1.275 or later, one line does both:
   `/plugin install citation-snowball --marketplace Andy-LZH/citation-snowball`.
-- Auto-update is **off by default** for marketplaces outside Anthropic's. To turn it on, open `/plugin`, go to
-  **Marketplaces**, choose `citation-snowball`, then **Enable auto-update**. New versions then install in the
-  background and load at your next session.
-- Plugin skills are namespaced, so per Claude Code's docs the command becomes `/citation-snowball:citation-snowball`.
-  Asking in plain language works either way.
-- Pick one install route. With both a `git clone` in `~/.claude/skills` and the plugin, Claude Code loads both
-  copies.
+- For automatic updates, open `/plugin`, go to **Marketplaces**, choose `citation-snowball`, then
+  **Enable auto-update**.
 
-**Update.** Every copy checks for a newer release once a day and tells you when there is one, with a "what's new"
-link. Plugin installs update through `/plugin`, or automatically once auto-update is on. For a `git clone`, ask your
-agent, or run:
+**Codex, GitHub Copilot, or Claude Code without the plugin:**
 
 ```sh
-python3 ~/.agents/skills/citation-snowball/scripts/fbsearch.py update   # or the ~/.claude/skills path
+git clone https://github.com/Andy-LZH/citation-snowball ~/.agents/skills/citation-snowball
 ```
 
-It runs `git pull --ff-only`, and refuses if you have local changes or the folder is on a branch other than `main`.
-Start new runs after updating, since a new version may change the workdir format. Set `FBS_NO_UPDATE_CHECK=1` to turn the check off.
+- Codex and Copilot read `~/.agents/skills`.
+- Claude Code reads `~/.claude/skills`: clone there instead, or symlink the folder above. Don't combine this with the
+  plugin, or the skill loads twice.
+- Codex sandboxes network access; approve it when the skill runs.
 
-**claude.ai:** zip the `citation-snowball` folder and upload it under Customize → Skills. The script needs internet
-access to the APIs below, so it only works if your code-execution settings allow it.
+**claude.ai:** zip the folder and upload it under Customize → Skills. It needs code execution with internet access.
 
 ## Use
 
-```
-/citation-snowball https://arxiv.org/abs/2306.01567
-```
+Ask your agent in plain language. A paper can be an arXiv link or ID, a DOI, a title, or an OpenReview or Semantic
+Scholar URL.
 
-Or ask in plain language. In Codex, mention `$citation-snowball`.
-
-- *"What should I compare DoRA against, and who has built on it since?"*
-- *"Here are two papers I like: 2505.18291 and 2407.09686. Give me a reading list."* Several seeds share one map.
+- *"What should I read and cite after InstructPart (arXiv 2505.18291)?"*
+- *"Here are two papers I like: 2505.18291 and 2407.09686. Give me one reading list."*
 - *"Only papers with at least 100 citations."* The agent passes `--min-citations 100`.
 - *"Always include the recent state of the art."* The agent passes `--expand always`.
-- *"Which new models should I keep an eye on for this task?"* Section C answers it.
 
-You get `<name>-reading-map.md` and `<name>-reading-map.bib` in the current directory.
+To call it by name: `/citation-snowball <paper>` in Claude Code (`/citation-snowball:citation-snowball <paper>` with
+the plugin), or mention `$citation-snowball` in Codex.
 
-## Requirements and setup
+The map is saved as `<name>-reading-map.md`, with `<name>-reading-map.bib` next to it, in the current directory.
 
-- Python 3.8+ (standard library only) and internet access.
-- **Recommended: a free [Semantic Scholar API key](https://www.semanticscholar.org/product/api#api-key-form).**
-  Without one, requests go through a shared pool that is often busy. The script retries patiently, so a run takes
-  5-20 minutes instead of one or two.
-  ```sh
-  echo 'export S2_API_KEY=your-key' >> ~/.zshrc
-  ```
-- **Recommended: `gh auth login` (or `GH_TOKEN`)** for GitHub stars and READMEs. Without a token, stars come from
-  Hugging Face's cached counts and READMEs from raw.githubusercontent.com.
-- Check your setup:
-  ```sh
-  python3 ~/.claude/skills/citation-snowball/scripts/fbsearch.py doctor
-  ```
+## What you get
 
-## Commands
+Five short sections. Each paper gets one line on why to read it, plus its code and stars when it has a repo. From the
+[full example for InstructPart](examples/instructpart.md):
 
-The agent runs these for you; they are listed for the curious and for contributors.
-
-| Stage | Command | Output |
+| Section | What it holds | In the example |
 |---|---|---|
-| Backward | `fbsearch.py backward SEED [SEED ...]` | Proposed comparison set with each reference's role and evidence (e.g. `in Table 2 (row)`) |
-| Review | `fbsearch.py core --workdir W ...` | The agent fixes roles, drops hubs and components, adds misses |
-| Forward | `fbsearch.py forward --workdir W --query ... --keywords ...` | `pool.json` (everything screened, and the co-citation counts), then runs `select` |
-| Select | `fbsearch.py select --workdir W [gate flags]` | `candidates.json`, `briefs.md`; re-cuts the pool in seconds, e.g. after excluding papers |
-| Reasons | the agent writes `diffs.json` | One "why read it" sentence per paper, read-first picks, dataset/model label fixes |
-| Report | `fbsearch.py report --workdir W --out map.md` | `map.md` and `map.bib` |
-| Update | `fbsearch.py update` | `git pull --ff-only` of the skill's folder; `doctor` shows whether a newer release is out |
+| **Read these first** | 5-8 picks from the sections below | LISA, ADE20K, PACO, SAM 3, … |
+| **A1. What it compares against** | the baselines and datasets in its result tables | LISA, Shikra, PACO, PartImageNet |
+| **A2. What the field builds on** | datasets and models it and the compared works commonly cite | COCO, RefCOCO, ADE20K, CLIP, SAM, LLaVA |
+| **B. Influential follow-ups** | influential papers citing it, or citing what it compares against when it is new | SAM3-I, Seg-Zero, Sa2VA, UniPixel |
+| **C. Latest models to keep an eye on** | what the area's newest papers build on | SAM 2, SAM 3, Qwen2.5-VL, Qwen3-VL |
 
-Details: [`references/methodology.md`](references/methodology.md),
-[`references/data-sources.md`](references/data-sources.md), [`references/report-format.md`](references/report-format.md).
+Two entries from its "Read these first":
 
-## Data sources
+> 2. [Scene Parsing through ADE20K Dataset](https://doi.org/10.1109/CVPR.2017.544) · 2017 · 4.1k citations · [CSAILVision/semantic-segmentation-pytorch](https://github.com/CSAILVision/semantic-segmentation-pytorch) ★5.1k  
+>    ↩ Foundation: cited by 6 of 15 (seed + compared works) · 14% of recent area papers. Scene parsing dataset with object and part annotations over 150 categories; the standard semantic-segmentation benchmark the compared open-vocabulary models report on, at object rather than task level.
+>
+> …
+>
+> 7. [**SAM 3**: Segment Anything with Concepts](https://arxiv.org/abs/2511.16719) · 2025 · 1.2k citations · [facebookresearch/sam3](https://github.com/facebookresearch/sam3) ★12k  
+>    ↪ Latest model: cited by 24% of the area's papers since it appeared (23 of 94). Segments every instance of a concept given a short noun phrase or image exemplar; the model SAM3-I builds on, and the strongest new prompt-to-mask baseline to test on part instructions.
 
-- **Semantic Scholar:** citations, references, counts, abstracts and BibTeX.
-- **arXiv:** full text and metadata.
-- **Hugging Face:** paper pages, models, datasets and spaces.
-- **GitHub:** repos, stars and READMEs.
-- **OpenAlex:** most-cited citers, optional.
+## How it works
 
-Responses are cached in `~/.cache/citation-snowball`.
+A helper script does the API work, and your agent supplies the judgment.
 
-**Google Scholar is never queried.** It has no API, its robots.txt disallows automated access, and Google blocks
-automated traffic. Citation counts are therefore Semantic Scholar's, which are usually 1.4-1.8x lower than Google
-Scholar's.
+- **The script** reads the paper's tables, counts what the paper and the works it compares against cite in common
+  (co-citation), screens the papers that cite it, and finds code on GitHub and Hugging Face.
+- **The agent** confirms the comparison set, chooses the topic keywords and writes the one-line reasons.
 
-## Limitations
+Data comes from Semantic Scholar, arXiv, Hugging Face, GitHub and OpenAlex. Google Scholar is never queried, so
+citation counts are Semantic Scholar's.
 
-- **Full text.** Works best for arXiv papers with an HTML version. For other papers the script saves the PDF, and
-  the agent reads the tables itself.
-- **Semantic Scholar gaps.** Some papers lack reference lists, and a few records are duplicated. OpenAlex
-  undercounts arXiv-heavy fields, so it is only used to find candidates, never for counts.
-- **Code discovery** relies on links from the paper, its Hugging Face page or a GitHub search. Repos that neither
-  link back to the paper nor name it can be missed. Weak matches are shown as unverified and never count toward the
-  gate.
-- **The docs score is a heuristic.** It reads README headings and wording, not the code.
-- **Co-citation needs reference lists.**
-  - A2 and C rest on the reference lists Semantic Scholar has; the report says how many.
-  - A niche area with few recent papers gives a thin C.
-  - The dataset/model split in A2 is a heuristic the agent corrects.
-- **Widening's quality depends on `--keywords`.** Bare generic words such as "segmentation" let in neighbouring work.
+More detail:
+
+- [`SKILL.md`](SKILL.md): the workflow the agent follows.
+- [`references/methodology.md`](references/methodology.md): every bar and how it was set, and the
+  [known limitations](references/methodology.md#14-limitations).
+- [`references/data-sources.md`](references/data-sources.md): APIs, keys and environment variables.
+- [`references/report-format.md`](references/report-format.md): the files it writes.
+
+## Updates
+
+- **Plugin installs** update through `/plugin`, or by themselves once auto-update is on.
+- **Folder installs** check for a new release once a day and say when there is one. Ask your agent to update, or run
+  `python3 ~/.agents/skills/citation-snowball/scripts/fbsearch.py update`. Set `FBS_NO_UPDATE_CHECK=1` to turn the
+  check off.
+
+What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
-Issues and pull requests are welcome, especially reports of a paper the map should have found, with the seed and
-the command. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the offline test suite, and how to propose a change
-to the gates. Releases follow [Semantic Versioning](https://semver.org); every change is listed in the
-[changelog](CHANGELOG.md).
+Bug reports and pull requests are welcome, especially a paper the map should have found, with the seed you used.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the offline tests and how releases work.
 
 ## License
 

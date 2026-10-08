@@ -17,6 +17,7 @@ Contents:
 11. The influence gate
 12. Ranking, caps and the read-first list
 13. Judging the result
+14. Limitations
 
 ## 1. Background: snowballing and co-citation
 
@@ -40,6 +41,24 @@ Version 2 starts from one assumption: **the seed is good.** Several things follo
   no citation search can reach.
 
 ## 2. The sections at a glance
+
+```mermaid
+flowchart LR
+    S["Seed paper(s)"] --> T["Its results and<br/>comparison tables"]
+    T --> A1["A1. What it compares against<br/>(no citation bar)"]
+    T --> BC["Reference lists of the seed<br/>and its compared works"]
+    BC --> A2["A2. What the field builds on<br/>(co-cited, still used)"]
+    S --> F["Papers citing the seed<br/>(widened to on-topic citers of A1<br/>when fewer than 8 qualify)"]
+    F --> G{"Influence gate +<br/>same-area check"}
+    G --> B["B. Influential follow-ups<br/>(up to 15, SOTA score)"]
+    F --> AR["Recent area papers:<br/>what do they cite?"]
+    AR --> C["C. Latest models<br/>(cited by ≥15% of later papers)"]
+    AR -. confirms .-> A2
+    A1 --> R["Reading map:<br/>read-first list, tables, BibTeX"]
+    A2 --> R
+    B --> R
+    C --> R
+```
 
 | Section | Direction | Contents | Cap |
 |---|---|---|---|
@@ -368,3 +387,19 @@ candidate up.
 | An expected follow-up is missing | Find it in `pool.json` under `papers`. Absent means it was never screened: add the core paper it builds on, or broaden the query. Present means it failed the gate, the same-area check or the topic rule; its citations, stars, docs and `cited` show which. |
 | A paper is in only for its repo | That is the stars route: a paper with few citations but a popular, well-documented repo. Raise the bar with `--gate seed.recent=10,200`, or `EXCLUDE` it. |
 | The seed has no reference list and no HTML | Read the PDF and set the core set by hand. The forward routes still work. |
+
+## 14. Limitations
+
+- **Full text.** Works best for arXiv papers with an HTML version. For other papers the script saves the PDF, and
+  the agent reads the tables itself.
+- **Semantic Scholar gaps.** Some papers lack reference lists, and a few records are duplicated. OpenAlex
+  undercounts arXiv-heavy fields, so it is only used to find candidates, never for counts.
+- **Code discovery** relies on links from the paper, its Hugging Face page or a GitHub search. Repos that neither
+  link back to the paper nor name it can be missed. Weak matches are shown as unverified and never count toward the
+  gate.
+- **The docs score is a heuristic.** It reads README headings and wording, not the code.
+- **Co-citation needs reference lists.**
+  - A2 and C rest on the reference lists Semantic Scholar has; the report says how many.
+  - A niche area with few recent papers gives a thin C.
+  - The dataset/model split in A2 is a heuristic the agent corrects.
+- **Widening's quality depends on `--keywords`.** Bare generic words such as "segmentation" let in neighbouring work.
