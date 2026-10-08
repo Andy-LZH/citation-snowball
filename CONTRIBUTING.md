@@ -73,7 +73,8 @@ with `gh auth login`. Without them, real runs take many minutes and the stars ro
 | `test_cocitation.py` | sections A2 and C: co-citation paths, specificity, dataset labels, twins, the latest-model window, the same-area check |
 | `test_report.py` | the rendered reading map, read-first picks, the BibTeX file |
 | `test_backward.py` | seed parsing, multi-seed core merging, README docs score, code discovery |
-| `test_version.py` | version consistency |
+| `test_update.py` | the update check: version order, once-a-day caching, failures, opt-out |
+| `test_version.py` | version consistency, and the README excerpt against the example map |
 
 ## Trying a change on real papers
 
@@ -131,22 +132,27 @@ without warning.
 | **Patch** (1.x.y) | Bug fixes and documentation that leave a typical seed's selection unchanged. |
 | **Major** (2.0.0) | Removing the deprecated flags, adding a required dependency, or changing the agent workflow in SKILL.md so that old instructions no longer work. |
 
-The version lives in three places, and the tests check that they match:
+The version lives in four places, and the tests check that they match:
 
 - `VERSION` in `scripts/fbsearch.py`, which is also sent in the User-Agent and printed in each report's footnote;
 - `metadata.version` in `SKILL.md`;
-- the top `## [x.y.z] - YYYY-MM-DD` entry in `CHANGELOG.md`.
+- the top `## [x.y.z] - YYYY-MM-DD` entry in `CHANGELOG.md`;
+- the plugin's `version` in `.claude-plugin/marketplace.json`. Claude Code only updates plugin installs when this
+  string changes.
 
 Deprecated flags keep working, with a notice, until the next major version.
 
 ## Release checklist (maintainers)
 
 1. Move the `[Unreleased]` entries into a new `## [x.y.z] - YYYY-MM-DD` section.
-2. Bump `VERSION` and `metadata.version`.
+2. Bump `VERSION`, `metadata.version` and the `version` in `.claude-plugin/marketplace.json`, then run
+   `claude plugin validate .`.
 3. Run the tests on Python 3.8 and a current Python, and do one real run.
 4. Merge to `main`.
 5. Tag `vX.Y.Z` and push the tag.
-6. Create a GitHub release whose notes are the CHANGELOG section.
+6. Create a GitHub release whose notes are the CHANGELOG section, e.g.
+   `gh release create vX.Y.Z --title "vX.Y.Z: ..." --notes-file <(awk '/^## \[X.Y.Z\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)`.
+   Installed copies learn about the new version from GitHub's "latest release", so a tag alone is not enough.
 
 ## Pull request checklist
 

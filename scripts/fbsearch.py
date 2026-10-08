@@ -17,7 +17,10 @@ Stages (each reads/writes JSON in a work directory):
                  abstracts, BibTeX and code for the kept papers -> candidates.json briefs.md
   report         render the reading map, merging the agent-written diffs.json -> report.md references.bib
 
-Helpers: doctor (check APIs, keys, tools) | resolve SEED | code ID... (debug code discovery)
+Helpers: doctor (check APIs, keys, tools, updates) | update (git pull this skill) | resolve SEED | code ID...
+
+`backward` checks GitHub for a newer release at most once a day (FBS_NO_UPDATE_CHECK=1 turns that off) and prints an
+UPDATE line when there is one.
 
 HTTP responses are cached in ~/.cache/citation-snowball (--cache-dir or FBS_CACHE_DIR to change).
 Standard library only (Python 3.8+). Needs network access.
@@ -45,10 +48,11 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
+REPO = "Andy-LZH/citation-snowball"  # where new releases are published (FBS_UPDATE_REPO=owner/name for a fork)
 S2 = "https://api.semanticscholar.org/graph/v1"
 OPENALEX = "https://api.openalex.org"
-UA = "citation-snowball/%s (+https://github.com/Andy-LZH/citation-snowball; python-urllib)" % VERSION
+UA = "citation-snowball/%s (+https://github.com/%s; python-urllib)" % (VERSION, REPO)
 MISSING = "\x00missing\x00"
 # Core papers above max(this, 10x the most-cited seed's citations) count half toward relevance, and widening does not
 # fetch their citers: nearly every paper in the area cites SAM, CLIP or DINOv2, so their citers are noise.
@@ -1688,6 +1692,120 @@ class OpenAlex:
         return out
 
 
+# ----------------------------------------------------------------------------- updates
+
+def version_tuple(version: str | None) -> tuple:
+    """'v1.10.0' -> (1, 10, 0), so 1.10 sorts after 1.9; anything unparsable -> ()."""
+    m = re.match(r"v?(\d+(?:\.\d+)*)", (version or "").strip())
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def fetch_latest_release() -> dict:
+    """GitHub's latest published release of this skill (no token needed; 3-second timeout)."""
+    repo = os.environ.get("FBS_UPDATE_REPO") or REPO
+    req = urllib.request.Request("https://api.github.com/repos/%s/releases/latest" % repo,
+                                 headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def latest_release(cache_dir: str | None, max_age_hours: float = 24, fetch=None) -> dict | None:
+    """{"version", "url"} of the latest release, asked at most once per `max_age_hours`: the answer, or the failure, is
+    cached in <cache>/update-check.json. Any error (offline, rate limit, no release yet) just means "unknown"."""
+    path = os.path.join(cache_dir, "update-check.json") if cache_dir else None
+    try:
+        cached = load_json(path) if path else None
+    except ValueError:
+        cached = None
+    if cached and time.time() - (cached.get("checked") or 0) < max_age_hours * 3600:
+        return cached.get("latest")
+    try:
+        data = (fetch or fetch_latest_release)()
+        latest = {"version": str(data["tag_name"]).lstrip("v"), "url": data.get("html_url")}
+    except Exception:  # an update check must never break a run
+        latest = None
+    if path:
+        try:
+            save_json(path, {"checked": time.time(), "latest": latest})
+        except OSError:
+            pass
+    return latest
+
+
+PLUGIN_HINT = ("it was installed as a Claude Code plugin, so update it with `/plugin` (Installed tab, Update now), or "
+               "turn on auto-update for its marketplace under /plugin -> Marketplaces")
+
+
+def installed_as_plugin(path: str) -> bool:
+    """True for a copy Claude Code installed from the plugin marketplace: it lives in ~/.claude/plugins/ (or under
+    $CLAUDE_CONFIG_DIR/plugins/), which Claude Code manages, so git must not touch it."""
+    parts = os.path.realpath(path).split(os.sep)
+    return any(a == ".claude" and b == "plugins" for a, b in zip(parts, parts[1:])) or bool(
+        os.environ.get("CLAUDE_CONFIG_DIR") and os.path.realpath(path).startswith(
+            os.path.join(os.path.realpath(os.environ["CLAUDE_CONFIG_DIR"]), "plugins") + os.sep))
+
+
+def update_notice(cache_dir: str | None, fetch=None, script: str | None = None) -> str | None:
+    """One line when a newer release is out, else None. Checked at most once a day; FBS_NO_UPDATE_CHECK=1 turns it
+    off."""
+    if os.environ.get("FBS_NO_UPDATE_CHECK"):
+        return None
+    latest = latest_release(cache_dir, fetch=fetch)
+    if not latest or version_tuple(latest["version"]) <= version_tuple(VERSION):
+        return None
+    script = os.path.realpath(script or __file__)
+    how = PLUGIN_HINT if installed_as_plugin(script) else "run: python3 %s update" % script
+    return ("citation-snowball %s is out (this copy is %s); what's new: %s. Ask the user before updating, and not "
+            "in the middle of a run; %s" % (latest["version"], VERSION, latest.get("url") or
+                                            "https://github.com/%s/releases" % REPO, how))
+
+
+def update_blocker(skill_dir: str) -> str | None:
+    """Why `update` must not touch this copy, or None. It must be a git clone, git must be installed, there must be no
+    local changes, and it must be on the branch releases land on: a clone left on a merged feature branch would
+    otherwise fail with a bare git error. A Claude Code plugin copy is Claude Code's to update (checked first: its
+    cache can itself be a git clone)."""
+    if installed_as_plugin(skill_dir):
+        return "This copy was not updated: " + PLUGIN_HINT + "."
+    if not os.path.isdir(os.path.join(skill_dir, ".git")):
+        return ("This copy is not a git clone, so it cannot update itself. Download the latest release from "
+                "https://github.com/%s/releases and replace %s with it." % (REPO, skill_dir))
+    if not shutil.which("git"):
+        return "git is not installed; install it, or download the latest release from https://github.com/%s/releases." % REPO
+
+    def git(*argv):
+        return subprocess.run(["git", "-C", skill_dir] + list(argv), capture_output=True, text=True).stdout.strip()
+
+    if git("status", "--porcelain", "--untracked-files=no"):
+        return ("This copy has local changes, so it was not updated. Commit or stash them first "
+                "(git -C %s status)." % skill_dir)
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    default = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD").split("/", 1)[-1] or "main"
+    if branch != default:
+        return ("This copy is on %s, but releases land on %s. Switch first: git -C %s checkout %s"
+                % ("a detached HEAD" if branch == "HEAD" else "branch " + branch, default, skill_dir, default))
+    return None
+
+
+def cmd_update(args) -> None:
+    """Update this copy of the skill to the latest version: `git pull --ff-only` in its folder when it is a git clone
+    without local changes. Works the same for Claude Code, Codex and Copilot, which all read the same folder."""
+    skill_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    latest = latest_release(writable_dir(args.cache_dir) if args.cache_dir else None, max_age_hours=0)
+    print("THIS    citation-snowball %s in %s" % (VERSION, skill_dir))
+    print("LATEST  %s" % ("%s (%s)" % (latest["version"], latest.get("url")) if latest else "unknown (GitHub did not answer)"))
+    blocker = update_blocker(skill_dir)
+    if blocker:
+        raise SystemExit(blocker)
+    pulled = subprocess.run(["git", "-C", skill_dir, "pull", "--ff-only"], capture_output=True, text=True)
+    print((pulled.stdout + pulled.stderr).strip())
+    if pulled.returncode != 0:
+        raise SystemExit("git pull failed, so nothing was changed. Run `git -C %s pull` yourself to see why." % skill_dir)
+    with open(os.path.realpath(__file__), encoding="utf-8") as fh:
+        now = re.search(r'^VERSION = "([^"]+)"', fh.read(), re.M)
+    print("NOW     citation-snowball %s" % (now.group(1) if now else "?"))
+
+
 # ----------------------------------------------------------------------------- stages
 
 def workdir_for(args, seed_title: str | None = None, n_seeds: int = 1) -> str:
@@ -1747,7 +1865,7 @@ def cmd_backward(args) -> None:
     save_json(os.path.join(wd, "seeds.json"), seeds)
     core = merge_cores(wd, seeds, args.max_core)
     save_json(os.path.join(wd, "core.json"), core)
-    print_backward_summary(wd, seeds, summaries, core, http)
+    print_backward_summary(wd, seeds, summaries, core, http, update_notice(http.cache_dir))
 
 
 def backward_one(http: Http, args, wd: str, seed: dict) -> tuple:
@@ -1887,9 +2005,10 @@ def core_line(row: dict, multi: bool) -> str:
         (row["title"] or "")[:70], "; ".join(row.get("evidence") or [])[:150])
 
 
-def print_backward_summary(wd: str, seeds: list, summaries: list, core: list, http: Http) -> None:
+def print_backward_summary(wd: str, seeds: list, summaries: list, core: list, http: Http,
+                           notice: str | None = None) -> None:
     multi = len(seeds) > 1
-    out = ["WORKDIR %s" % wd]
+    out = ["WORKDIR %s" % wd] + (["UPDATE  %s" % notice] if notice else [])
     for lines in summaries:
         out += lines
     if multi:
@@ -3387,7 +3506,13 @@ def probe(url: str, headers: dict | None = None) -> tuple:
 def cmd_doctor(args) -> None:
     """Check the APIs, keys and tools the skill uses, and say what would make runs faster."""
     rows, tips = [], []
-    rows.append(("citation-snowball", VERSION, "this script"))
+    latest = latest_release(writable_dir(args.cache_dir) if args.cache_dir else None, max_age_hours=0)
+    newer = bool(latest) and version_tuple(latest["version"]) > version_tuple(VERSION)
+    rows.append(("citation-snowball", "%s; latest release %s" % (VERSION, latest["version"] if latest else "unknown")
+                 + (" - update with `fbsearch.py update`" if newer else " (up to date)" if latest else ""), "this script"))
+    if newer:
+        tips.append("citation-snowball %s is out: `python3 %s update` (what's new: %s)."
+                    % (latest["version"], os.path.realpath(__file__), latest.get("url")))
     rows.append(("python", sys.version.split()[0], "ok" if sys.version_info >= (3, 8) else "needs Python 3.8+"))
     key = s2_key()
     n = 2 if key else 6
@@ -3491,7 +3616,7 @@ def main(argv=None) -> None:
                         help="HTTP cache shared across runs (default: %(default)s; FBS_CACHE_DIR overrides)")
     common.add_argument("--refresh", action="store_true", help="ignore cached HTTP responses")
 
-    p = sub.add_parser("doctor", parents=[common], help="check APIs, keys and tools")
+    p = sub.add_parser("doctor", parents=[common], help="check APIs, keys, tools and whether a newer version is out")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("resolve", parents=[common],
@@ -3558,6 +3683,10 @@ def main(argv=None) -> None:
     p.add_argument("--read-first", type=int, default=8, help="papers in 'Read these first' without agent picks (default 8)")
     p.add_argument("--no-bib", action="store_true", help="do not write the BibTeX file")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("update", parents=[common],
+                       help="update this copy of the skill to the latest release (git pull --ff-only in its folder)")
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("code", parents=[common], help="debug: find code for papers (arXiv ids, DOIs or S2 ids)")
     p.add_argument("ids", nargs="+")

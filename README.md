@@ -1,7 +1,7 @@
 # citation-snowball
 
 [![CI](https://github.com/Andy-LZH/citation-snowball/actions/workflows/ci.yml/badge.svg)](https://github.com/Andy-LZH/citation-snowball/actions/workflows/ci.yml)
-![version](https://img.shields.io/badge/version-1.3.0-blue)
+![version](https://img.shields.io/badge/version-1.4.0-blue)
 ![python](https://img.shields.io/badge/python-3.8%2B%20·%20stdlib%20only-informational)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -160,8 +160,33 @@ ln -s ~/.agents/skills/citation-snowball ~/.claude/skills/citation-snowball
 - Copilot CLI needs version 1.0.11 or later.
 - Codex sandboxes network access by default; approve it when the skill runs.
 
-**Update:** `git -C ~/.agents/skills/citation-snowball pull` (or the `~/.claude/skills` path). Version 2 changed
-the workdir format, so start new runs after updating.
+**Claude Code, as a plugin.** This is the route that can update itself:
+
+```
+/plugin marketplace add Andy-LZH/citation-snowball
+/plugin install citation-snowball@citation-snowball
+```
+
+- On Claude Code 2.1.275 or later, one line does both:
+  `/plugin install citation-snowball --marketplace Andy-LZH/citation-snowball`.
+- Auto-update is **off by default** for marketplaces outside Anthropic's. To turn it on, open `/plugin`, go to
+  **Marketplaces**, choose `citation-snowball`, then **Enable auto-update**. New versions then install in the
+  background and load at your next session.
+- Plugin skills are namespaced, so per Claude Code's docs the command becomes `/citation-snowball:citation-snowball`.
+  Asking in plain language works either way.
+- Pick one install route. With both a `git clone` in `~/.claude/skills` and the plugin, Claude Code loads both
+  copies.
+
+**Update.** Every copy checks for a newer release once a day and tells you when there is one, with a "what's new"
+link. Plugin installs update through `/plugin`, or automatically once auto-update is on. For a `git clone`, ask your
+agent, or run:
+
+```sh
+python3 ~/.agents/skills/citation-snowball/scripts/fbsearch.py update   # or the ~/.claude/skills path
+```
+
+It runs `git pull --ff-only`, and refuses if you have local changes or the folder is on a branch other than `main`.
+Start new runs after updating, since a new version may change the workdir format. Set `FBS_NO_UPDATE_CHECK=1` to turn the check off.
 
 **claude.ai:** zip the `citation-snowball` folder and upload it under Customize → Skills. The script needs internet
 access to the APIs below, so it only works if your code-execution settings allow it.
@@ -210,6 +235,7 @@ The agent runs these for you; they are listed for the curious and for contributo
 | Select | `fbsearch.py select --workdir W [gate flags]` | `candidates.json`, `briefs.md`; re-cuts the pool in seconds, e.g. after excluding papers |
 | Reasons | the agent writes `diffs.json` | One "why read it" sentence per paper, read-first picks, dataset/model label fixes |
 | Report | `fbsearch.py report --workdir W --out map.md` | `map.md` and `map.bib` |
+| Update | `fbsearch.py update` | `git pull --ff-only` of the skill's folder; `doctor` shows whether a newer release is out |
 
 Details: [`references/methodology.md`](references/methodology.md),
 [`references/data-sources.md`](references/data-sources.md), [`references/report-format.md`](references/report-format.md).

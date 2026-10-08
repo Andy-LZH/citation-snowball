@@ -81,6 +81,9 @@ The Graph API (`https://api.semanticscholar.org/graph/v1`) supplies:
   per month), `pushedAt` and the description. The token is `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`.
   Without one, REST allows 60 requests per hour: the script queries up to 55 repos, and the stars probe uses
   Hugging Face's `githubStars` only.
+- **Releases.** Once a day, `backward` asks `repos/Andy-LZH/citation-snowball/releases/latest` (no token, 3-second
+  timeout, cached in `update-check.json`) whether a newer version of the skill is out. The request carries only the
+  User-Agent with the installed version. `FBS_NO_UPDATE_CHECK=1` turns it off.
 - **READMEs** for the docs score come from `repos/{repo}/readme` (raw) with a token, and from
   `raw.githubusercontent.com/{repo}/HEAD/README.md` (no quota) without one. The score gives one point each for setup,
   usage, training, evaluation and released weights. A check counts when a README heading matches, or the text matches
@@ -149,6 +152,8 @@ protective measures. Automated traffic can also get the user's whole network CAP
 | `OPENALEX_API_KEY` | OpenAlex key (10x daily budget). |
 | `FBS_CACHE_DIR` | HTTP cache location (default `~/.cache/citation-snowball`; falls back to the system temp dir if not writable). |
 | `FBS_S2_PATIENCE` | Seconds to keep retrying one keyless Semantic Scholar request (default 900). |
+| `FBS_NO_UPDATE_CHECK` | Set to turn off the daily check for a newer release of the skill. |
+| `FBS_UPDATE_REPO` | `owner/name` of the repo whose releases the update check reads (default `Andy-LZH/citation-snowball`). |
 
 Cached responses live 7-60 days depending on the endpoint; `--refresh` ignores the cache. Delete the cache folder to
 reclaim space.
