@@ -2,7 +2,7 @@
 name: citation-snowball
 description: "Turns one or more seed papers into a short, ranked reading map instead of a long list. (A) what the seed compares against in its tables, plus the foundations it and those works all cite (datasets, benchmarks, base models, found by co-citation); (B) influential follow-ups: papers citing the seed with at least 50 citations, fewer if recent, or a popular, well-documented GitHub repo, widened to recent on-topic work on the compared models when few cite the seed; (C) the latest models recent work in the area builds on, found from the citing side even when Semantic Scholar has no reference list for them. Each paper gets code with stars and a README-quality score, one line on why to read it, a 'read these first' list and BibTeX. Use when the user shares a paper they like (arXiv link or ID, DOI, title, OpenReview or Semantic Scholar URL), or several, and wants related work, baselines, datasets or foundations, papers that cite it, follow-up or recent SOTA work, models to watch, a reading list, or code."
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   requirements: "Python 3.8+ (standard library only) with internet access to Semantic Scholar, arXiv, Hugging Face, GitHub and OpenAlex. Optional: S2_API_KEY for much faster runs, a gh CLI login or GH_TOKEN for GitHub stars and READMEs."
 ---
 
@@ -55,6 +55,13 @@ one-line reasons, picks and dataset labels (step 4).
   or the gh CLI login when present.
 - `forward` can stay quiet for minutes while it retries. Run it in the background if your environment supports that,
   and don't kill it for being slow. Results are cached in `~/.cache/citation-snowball`, so re-runs are fast.
+- **Updates.** `backward` checks GitHub for a newer release at most once a day. When there is one, it prints an
+  `UPDATE` line. Tell the user once, with the "what's new" link, and ask before updating. Don't update in the middle
+  of a run, because a new version may change the workdir format; run `fbsearch.py update` before the next run
+  instead. It does a `git pull --ff-only` in the skill's folder, and refuses if there are local changes or the
+  folder is not on `main`. A copy installed as a Claude Code plugin updates through `/plugin` (or by itself once
+  auto-update is on), and the `UPDATE` line says so.
+  `FBS_NO_UPDATE_CHECK=1` turns the check off.
 
 ## Workflow
 

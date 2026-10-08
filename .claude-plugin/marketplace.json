@@ -1,0 +1,15 @@
+{
+  "name": "citation-snowball",
+  "owner": { "name": "Andy-LZH" },
+  "description": "Reading maps from the papers you like: what they compare against, what the field builds on, influential follow-ups and the latest models, with code.",
+  "plugins": [
+    {
+      "name": "citation-snowball",
+      "source": ".",
+      "description": "Turns one or more seed papers into a short, ranked reading map with code, a read-first list and BibTeX.",
+      "version": "1.4.0",
+      "homepage": "https://github.com/Andy-LZH/citation-snowball",
+      "license": "MIT"
+    }
+  ]
+}

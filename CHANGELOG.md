@@ -7,6 +7,35 @@ what counts as major, minor and patch here.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-08
+
+**Know when there is something new.** The skill now tells you when a newer release is out, in every agent that runs
+it (Claude Code, Codex, Copilot), and updates itself with one command when you agree.
+
+### Added
+
+- **Update check.** `backward` asks GitHub for the latest release of the skill at most once a day, with a 3-second
+  timeout.
+  - The answer, or the failure, is cached in `~/.cache/citation-snowball/update-check.json`.
+  - When a newer release exists, the summary shows an `UPDATE` line with the "what's new" link. SKILL.md tells the
+    agent to mention it once and ask before updating.
+  - The check never breaks a run, and `FBS_NO_UPDATE_CHECK=1` turns it off.
+- **`fbsearch.py update`.** Runs `git pull --ff-only` in the skill's folder and prints the old and new version.
+  - It refuses, and says what to do, when the folder has local changes, is on a branch other than the one releases
+    land on (`main`), or is not a git clone (then it says where to download the release).
+  - Claude Code, Codex and Copilot read the same folder, so one update covers all three.
+- **Claude Code plugin marketplace** (`.claude-plugin/marketplace.json`).
+  - Claude Code users can install with `/plugin marketplace add Andy-LZH/citation-snowball` and
+    `/plugin install citation-snowball@citation-snowball`.
+  - Turning on auto-update under `/plugin` → Marketplaces makes new releases install themselves.
+  - The repo root stays the skill, so `git clone` installs work as before. There is deliberately no `plugin.json`,
+    which would make a clone in `~/.claude/skills` load twice.
+  - Validated with `claude plugin validate` (passes), and loads as one skill with no agents or hooks.
+- **Plugin-aware updates.** In a copy installed through `/plugin`, the `UPDATE` line and `fbsearch.py update` point
+  to `/plugin` instead of git, because Claude Code manages that folder.
+- **`doctor` shows the latest release** next to the installed version, and a tip when an update is available.
+- `FBS_UPDATE_REPO=owner/name` points the check at a fork.
+
 ## [1.3.0] - 2026-10-08
 
 **A reading map instead of a long list.** 1.2 listed every influential paper it could find; on a 2025 benchmark

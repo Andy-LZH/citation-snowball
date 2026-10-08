@@ -24,6 +24,12 @@ class VersionConsistency(unittest.TestCase):
         self.assertIsNotNone(m, "CHANGELOG.md needs a '## [x.y.z] - date' entry")
         self.assertEqual(m.group(1), fbsearch.VERSION)
 
+    def test_plugin_marketplace_version_matches_the_script(self):
+        # Claude Code only updates plugin installs when this string changes; a forgotten bump strands those users.
+        import json
+        plugins = json.loads(read(".claude-plugin/marketplace.json"))["plugins"]
+        self.assertEqual([p["version"] for p in plugins if p["name"] == "citation-snowball"], [fbsearch.VERSION])
+
     def test_user_agent_carries_the_version(self):
         self.assertIn("citation-snowball/%s" % fbsearch.VERSION, fbsearch.UA)
 
