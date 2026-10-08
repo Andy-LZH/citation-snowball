@@ -4,19 +4,37 @@
     {
       "id": 1,
       "prompt": "I really like the HQ-SAM paper (https://arxiv.org/abs/2306.01567). Can you do a forward and backward citation search and give me a markdown list of the influential related papers with code?",
-      "expected_output": "A report.md whose comparison set lists SAM, CascadePSP, CRM, CoOp, AIM and LoRA as baselines; Section 1 contains SAM (facebookresearch/segment-anything) and segmentation-refinement follow-ups such as SegRefiner; every row has a one-sentence difference from HQ-SAM.",
+      "expected_output": "A reading map whose section A1 lists HQ-SAM's baselines (SAM, CascadePSP, CRM and the other methods in its results tables) with their code, and leaves out components it only uses. A2 lists datasets and models that HQ-SAM and its baselines co-cite and recent work still cites (for example COCO or LVIS). HQ-SAM has hundreds of citers, so section B holds up to 15 influential papers citing it, ranked by SOTA score, such as segmentation-refinement follow-ups like SegRefiner, without widening (the WIDEN line says it was not needed). Section C names recent segmentation models the area builds on, such as SAM 2. A 'Read these first' list of 5-8 papers, one 'why read it' sentence per paper, and a .bib file next to the report.",
       "files": []
     },
     {
       "id": 2,
       "prompt": "Find the datasets that 'SPIN: Hierarchical Segmentation with Subpart Granularity in Natural Images' compares against, then the influential papers that cite those datasets, with GitHub links. Only keep papers with at least 50 citations.",
-      "expected_output": "Paper type treated as dataset; compared datasets include PartImageNet, PartNet and ADE20K; the forward search uses --min-citations 50; the report lists part-segmentation work with code first.",
+      "expected_output": "The paper type is dataset or mixed. Section A1 lists the compared part datasets (PartImageNet, PartNet, ADE20K and others from its comparison table) with no citation bar, and A2 the datasets and models they all build on. The forward search runs with --min-citations 50, a hard floor for section B that also turns the stars route off. SPIN has few citers, so B widens to recent, on-topic papers citing those datasets, each with at least 50 citations, marked 'builds on', with code links where they exist.",
       "files": []
     },
     {
       "id": 3,
       "prompt": "What should I compare DoRA (arXiv 2402.09353) against, and who has built on it since? Save the result as dora-related.md.",
-      "expected_output": "Baselines from DoRA's results tables (LoRA and other PEFT methods) in the comparison set; forward papers citing DoRA or several PEFT baselines; report saved to dora-related.md with code links and differences.",
+      "expected_output": "Section A1 lists DoRA's baselines from its results tables (LoRA and the other PEFT methods, with code), and A2 the models and benchmarks DoRA and those baselines all cite. Section B lists at most 15 influential papers citing DoRA, ranked by SOTA score so recent, well-starred work comes first, without widening. The report is saved as dora-related.md, with dora-related.bib next to it, a read-first list and one sentence per paper.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Here are two papers I like: InstructPart (2505.18291) and SPIN (2407.09686). Build me one reading list of what I should read and cite next.",
+      "expected_output": "One workdir with two seeds (seeds.json). Section A1 merges both comparison sets with a 'Compared by' column; papers both seeds compare against, such as LISA, PACO and PartImageNet, are marked as compared by both. A2 is counted over both seeds' and all compared works' reference lists. Section B holds influential papers citing either seed, saying which ('cites InstructPart'), widened to recent part-segmentation and reasoning-segmentation work with code such as Seg-Zero, Sa2VA, PartCrafter or PartField. Section C lists SAM 3 and Qwen-VL models. The title reads 'Reading map: InstructPart + SPIN'.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "I like InstructPart (https://arxiv.org/abs/2505.18291) but it is new and barely cited. What is the recent state of the art around it that I should read, preferably with well-documented code?",
+      "expected_output": "Only a few papers citing InstructPart qualify, so the WIDEN line says B was widened. Section B has at most 15 papers from the last 24 months on the seed's topic (reasoning or part segmentation, affordance), each citing a model or dataset from A1 or citing the seed, with its repo, stars, README docs score and why it was kept. No general-purpose multimodal LLMs that only co-cite the baselines (such as InternVL or MVBench), no 2023 papers among the widened rows, and no paper from another area that cites the seed in passing (the same-area check drops CRISP, a real2sim method). Section C lists the latest models the area builds on, with the share of recent papers using each.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "For InstructPart (2505.18291): which foundational datasets and models should I know, and which latest models should I keep an eye on for this task?",
+      "expected_output": "Section A2 lists the datasets and benchmarks the seed and its compared works co-cite: ADE20K, COCO and the RefCOCO family appear, each with 'cited by k of n' and its share of recent work, and the two ADE20K records are merged into one row. A2 also lists models and methods such as CLIP, SAM and LLaVA. Section C lists SAM 3 and at least one Qwen-VL model (Qwen2.5-VL or Qwen3-VL), with the share of later area papers citing each. The reply explains that Semantic Scholar has no reference list for SAM 3 or Qwen2.5-VL, so they are found from the citing side.",
       "files": []
     }
   ]
