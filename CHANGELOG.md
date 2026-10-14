@@ -12,8 +12,8 @@ what counts as major, minor and patch here.
 - **`--focus PHRASES`: say what you are looking for.** "Among these, the ones that use a DiT" →
   `--focus 'DiT,diffusion transformer,ViT'` on `forward` or `select`.
   - After the gates, the script reads each gate passer's Semantic Scholar abstract and the method section of its
-    arXiv HTML (every section or subsection headed Method, Approach, Architecture, ...) and marks the papers that
-    mention a phrase as a whole word (plurals and `DiT-XL/2` count).
+    arXiv HTML (the body sections that are not introduction, related work, experiments or conclusion, with their
+    subsections) and marks the papers that mention a phrase as a whole word (plurals and `DiT-XL/2` count).
   - Marked papers take section B's slots and the automatic "Read these first" picks first. The gates and the other
     sections' order are unchanged, so a weak paper never gets in for matching.
   - The report shows a **Focus** line, a `focus: DiT (abstract); ViT (method)` note under each matching title, and

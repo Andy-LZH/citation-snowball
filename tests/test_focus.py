@@ -25,19 +25,30 @@ class PhraseHits(unittest.TestCase):
         self.assertEqual(fbsearch.phrase_hits("a DiT", ["", " "]), [])
 
 
-HTML = """<html><body><article class="ltx_document">
-<section class="ltx_section" id="S1"><h2 class="ltx_title ltx_title_section">1 Introduction</h2>
-<div class="ltx_para"><p class="ltx_p">Prior work uses a DiT backbone.</p></div></section>
-<section class="ltx_section" id="S2"><h2 class="ltx_title ltx_title_section">2 Related Work</h2>
-<div class="ltx_para"><p class="ltx_p">DiT [1] and U-ViT [2] are diffusion transformers.</p></div></section>
-<section class="ltx_section" id="S3"><h2 class="ltx_title ltx_title_section">3 FooNet</h2>
+BODY = """<section class="ltx_section" id="S3"><h2 class="ltx_title ltx_title_section">3 FooNet</h2>
 <section class="ltx_subsection" id="S3.SS1"><h3 class="ltx_title ltx_title_subsection">3.1 Architecture</h3>
 <div class="ltx_para"><p class="ltx_p">We build on a ViT-L/14 encoder.</p></div></section>
 <section class="ltx_subsection" id="S3.SS2"><h3 class="ltx_title ltx_title_subsection">3.2 Training</h3>
 <div class="ltx_para"><p class="ltx_p">We train with Adam.</p></div></section></section>
-<section class="ltx_section" id="S4"><h2 class="ltx_title ltx_title_section">4 Experiments</h2>
-<div class="ltx_para"><p class="ltx_p">We compare against DiT-XL/2.</p></div></section>
+"""
+
+
+def page(body=BODY):
+    """A LaTeXML page like arxiv.org/html serves: introduction, related work, `body`, experiments, an appendix."""
+    return """<html><body><article class="ltx_document">
+<section class="ltx_section" id="S1"><h2 class="ltx_title ltx_title_section">1 Introduction</h2>
+<div class="ltx_para"><p class="ltx_p">Prior work uses a DiT backbone.</p></div></section>
+<section class="ltx_section" id="S2"><h2 class="ltx_title ltx_title_section">2 Related Work</h2>
+<div class="ltx_para"><p class="ltx_p">DiT [1] and U-ViT [2] are diffusion transformers.</p></div></section>
+""" + body + """<section class="ltx_section" id="S4"><h2 class="ltx_title ltx_title_section">4 Experiments</h2>
+<section class="ltx_subsection" id="S4.SS1"><h3 class="ltx_title ltx_title_subsection">4.1 State-of-the-Art Models</h3>
+<div class="ltx_para"><p class="ltx_p">We compare against DiT-XL/2.</p></div></section></section>
+<section class="ltx_appendix" id="A1"><h2 class="ltx_title ltx_title_appendix">Appendix A Proofs</h2>
+<div class="ltx_para"><p class="ltx_p">A lemma about U-Nets.</p></div></section>
 </article></body></html>"""
+
+
+HTML = page()
 
 
 class FakeHttp:
@@ -51,15 +62,28 @@ class FakeHttp:
 
 
 class MethodText(unittest.TestCase):
-    def test_takes_method_headed_sections_and_subsections_only(self):
-        text = fbsearch.method_text(FakeHttp({"https://arxiv.org/html/2501.00001": HTML}), "2501.00001")
-        self.assertIn("ViT-L/14", text)  # 3.1 Architecture, under a section named after the model
+    def check(self, body):
+        text = fbsearch.method_text(FakeHttp({"https://arxiv.org/html/2501.00001": page(body)}), "2501.00001")
+        self.assertIn("ViT-L/14", text)
+        self.assertIn("Adam", text)  # the whole body section, subsections included, whatever their headings
         self.assertNotIn("DiT", text)  # introduction, related work and experiments name prior work, not the method
-        self.assertNotIn("Adam", text)  # 3.2 Training is not a method heading
+        self.assertNotIn("U-Nets", text)  # and the appendix is left out
 
-    def test_empty_without_a_method_heading_and_none_without_html(self):
-        page = HTML.replace("3.1 Architecture", "3.1 Overview")
-        self.assertEqual(fbsearch.method_text(FakeHttp({"https://arxiv.org/html/2501.00001": page}), "2501.00001"), "")
+    def test_takes_the_body_sections_with_their_subsections(self):
+        self.check(BODY)  # "3 FooNet": a section named after the model
+        self.check(BODY.replace("3 FooNet", "3 Method"))
+        # DiT's body: "3 Diffusion Transformers" with "Preliminaries" (reads as related work) and "Design Space".
+        self.check(BODY.replace("3 FooNet", "3 Diffusion Transformers").replace("3.1 Architecture", "3.1 Preliminaries")
+                   .replace("3.2 Training", "3.2 Design Space"))
+
+    def test_subsection_headings_do_not_pull_in_results(self):
+        # "4.1 State-of-the-Art Models" under "4 Experiments" is where the fixture compares against DiT-XL/2.
+        text = fbsearch.method_text(FakeHttp({"https://arxiv.org/html/2501.00001": HTML}), "2501.00001")
+        self.assertNotIn("DiT-XL/2", text)
+
+    def test_empty_when_every_section_is_classified_and_none_without_html(self):
+        http = FakeHttp({"https://arxiv.org/html/2501.00001": page("")})
+        self.assertEqual(fbsearch.method_text(http, "2501.00001"), "")
         self.assertIsNone(fbsearch.method_text(FakeHttp({}), "2501.00002"))
 
 

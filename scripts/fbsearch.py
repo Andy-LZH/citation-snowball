@@ -1055,19 +1055,21 @@ def arxiv_html(http: Http, arxiv: str) -> tuple:
 
 
 def method_text(http: Http, arxiv: str) -> str | None:
-    """The text of the paper's method sections, for --focus: every section or subsection whose heading reads as method
-    (section_kind(): "Method", "Our Approach", "3.1 Architecture"), so a section named after the model still contributes
-    its architecture subsection. Related work, experiments and the introduction are left out: they name prior work and
-    baselines, not what the paper itself builds on. "" when the HTML has no such heading, None without HTML."""
+    """The text of the paper's method sections, for --focus: every top-level section whose heading reads as none of
+    introduction, related work, experiments or conclusion (section_kind()), with its subsections: "3 Method", a section
+    named after the model ("3 Diffusion Transformers"), a dataset paper's "3 Data Collection". The excluded sections
+    name prior work and baselines, not what the paper builds on, and so are the appendices. Subsection headings are
+    not consulted: "5.1 State-of-the-Art Diffusion Models" under "5 Experiments" is a results subsection, whatever its
+    title says. "" when every section is excluded, None without HTML."""
     _, page = arxiv_html(http, arxiv)
     if not page:
         return None
     parts = []
     for n in parse_html(page).iter():
-        if n.tag != "section" or not ("ltx_section" in n.classes or "ltx_subsection" in n.classes):
+        if n.tag != "section" or "ltx_section" not in n.classes:
             continue
         heading = next((k for k in n.iter() if k is not n and k.tag in ("h2", "h3") and "ltx_title" in k.classes), None)
-        if heading is not None and section_kind(heading.text()) == "method":
+        if heading is not None and section_kind(heading.text()) in ("method", "dataset", "other"):
             parts.append(n.text())
     return " ".join(parts)
 
@@ -3726,7 +3728,7 @@ def add_selection_args(p, defaults: bool) -> None:
                    help="age of the 'recent' bracket in months (default 12)" + note)
     p.add_argument("--mid-months", type=int, default=d["mid_months"],
                    help="age of the 'mid' bracket in months (default 24)" + note)
-    p.add_argument("--focus", default=d["focus"], metavar="PHRASES",
+    p.add_argument("--focus", metavar="PHRASES",  # no default: selection_config() falls back to the saved or empty list
                    help="what the user is looking for among the results, comma-separated, e.g. 'DiT,diffusion "
                         "transformer,ViT': papers whose abstract or arXiv-HTML method section mentions one rank first "
                         "in B and the read-first list and are marked in every section; the gates are unchanged ('' "
