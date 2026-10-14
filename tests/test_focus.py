@@ -43,6 +43,8 @@ def page(body=BODY):
 """ + body + """<section class="ltx_section" id="S4"><h2 class="ltx_title ltx_title_section">4 Experiments</h2>
 <section class="ltx_subsection" id="S4.SS1"><h3 class="ltx_title ltx_title_subsection">4.1 State-of-the-Art Models</h3>
 <div class="ltx_para"><p class="ltx_p">We compare against DiT-XL/2.</p></div></section></section>
+<section class="ltx_section" id="S5"><h2 class="ltx_title ltx_title_section">Acknowledgements</h2>
+<div class="ltx_para"><p class="ltx_p">Funded by the Army Research Laboratory.</p></div></section>
 <section class="ltx_appendix" id="A1"><h2 class="ltx_title ltx_title_appendix">Appendix A Proofs</h2>
 <div class="ltx_para"><p class="ltx_p">A lemma about U-Nets.</p></div></section>
 </article></body></html>"""
@@ -68,6 +70,7 @@ class MethodText(unittest.TestCase):
         self.assertIn("Adam", text)  # the whole body section, subsections included, whatever their headings
         self.assertNotIn("DiT", text)  # introduction, related work and experiments name prior work, not the method
         self.assertNotIn("U-Nets", text)  # and the appendix is left out
+        self.assertNotIn("Army", text)  # as are the acknowledgements: a funder is not something the paper builds on
 
     def test_takes_the_body_sections_with_their_subsections(self):
         self.check(BODY)  # "3 FooNet": a section named after the model
@@ -80,6 +83,9 @@ class MethodText(unittest.TestCase):
         # "4.1 State-of-the-Art Models" under "4 Experiments" is where the fixture compares against DiT-XL/2.
         text = fbsearch.method_text(FakeHttp({"https://arxiv.org/html/2501.00001": HTML}), "2501.00001")
         self.assertNotIn("DiT-XL/2", text)
+        # The user-facing claim: comparing against DiT does not count as using it.
+        self.assertEqual(fbsearch.phrase_hits(text, ["DiT", "Army Research Laboratory"]), [])
+        self.assertEqual(fbsearch.phrase_hits(text, ["ViT"]), ["ViT"])
 
     def test_empty_when_every_section_is_classified_and_none_without_html(self):
         http = FakeHttp({"https://arxiv.org/html/2501.00001": page("")})

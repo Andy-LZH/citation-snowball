@@ -1054,13 +1054,18 @@ def arxiv_html(http: Http, arxiv: str) -> tuple:
     return None, None
 
 
+FRONT_MATTER_RE = re.compile(r"acknowledg|ethic|broader impact|reproducib|funding|author contribution|data availability",
+                             re.I)
+
+
 def method_text(http: Http, arxiv: str) -> str | None:
     """The text of the paper's method sections, for --focus: every top-level section whose heading reads as none of
     introduction, related work, experiments or conclusion (section_kind()), with its subsections: "3 Method", a section
     named after the model ("3 Diffusion Transformers"), a dataset paper's "3 Data Collection". The excluded sections
-    name prior work and baselines, not what the paper builds on, and so are the appendices. Subsection headings are
-    not consulted: "5.1 State-of-the-Art Diffusion Models" under "5 Experiments" is a results subsection, whatever its
-    title says. "" when every section is excluded, None without HTML."""
+    name prior work and baselines, not what the paper builds on, and so are the appendices and the acknowledgements and
+    ethics statements (funders and affiliations would match a focus phrase). Subsection headings are not consulted:
+    "5.1 State-of-the-Art Diffusion Models" under "5 Experiments" is a results subsection, whatever its title says.
+    "" when every section is excluded, None without HTML."""
     _, page = arxiv_html(http, arxiv)
     if not page:
         return None
@@ -1069,7 +1074,8 @@ def method_text(http: Http, arxiv: str) -> str | None:
         if n.tag != "section" or "ltx_section" not in n.classes:
             continue
         heading = next((k for k in n.iter() if k is not n and k.tag in ("h2", "h3") and "ltx_title" in k.classes), None)
-        if heading is not None and section_kind(heading.text()) in ("method", "dataset", "other"):
+        title = heading.text() if heading is not None else ""
+        if title and section_kind(title) in ("method", "dataset", "other") and not FRONT_MATTER_RE.search(title):
             parts.append(n.text())
     return " ".join(parts)
 
