@@ -1054,8 +1054,8 @@ def arxiv_html(http: Http, arxiv: str) -> tuple:
     return None, None
 
 
-FRONT_MATTER_RE = re.compile(r"acknowledg|ethic|broader impact|reproducib|funding|author contribution|data availability",
-                             re.I)
+FRONT_MATTER_RE = re.compile(r"acknowledg|ethic|broader impact|reproducib|funding|author contribution|"
+                             r"data availability", re.I)
 
 
 def method_text(http: Http, arxiv: str) -> str | None:
