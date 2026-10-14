@@ -28,6 +28,11 @@ what counts as major, minor and patch here.
   [Karpathy's coding guidelines](https://github.com/multica-ai/andrej-karpathy-skills) (pin down the question before
   searching, the shortest map that answers it, surgical edits, verify against the seed then loop). The former "Rules"
   section moved into them; the workflow steps are unchanged apart from `--focus`.
+- **Why Google Scholar stays out, with sources.**
+  [`references/data-sources.md` §7](references/data-sources.md#7-google-scholar-not-used-and-why) now cites Google
+  Scholar's help page and robots.txt, the Stack Overflow thread on the missing API, and what the free tools
+  (scholar.py, archived in 2026 and unchanged since 2017; `scholarly`) and the paid services (SerpApi, Scrapeless)
+  do, and why none fits a tool that must stay free, dependency-free and within the site's policy.
 - **A shorter README, in the order you need it:** prerequisites (with where to get a Semantic Scholar key), then
   install (the Claude Code plugin first), use, and what you get. The flow diagram and the limitations moved to
   [`references/methodology.md`](references/methodology.md).
