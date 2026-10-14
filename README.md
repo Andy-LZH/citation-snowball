@@ -67,6 +67,8 @@ Scholar URL.
 - *"Here are two papers I like: 2505.18291 and 2407.09686. Give me one reading list."*
 - *"Only papers with at least 100 citations."* The agent passes `--min-citations 100`.
 - *"Always include the recent state of the art."* The agent passes `--expand always`.
+- *"Among these, I'm looking for the ones that use a DiT."* The agent passes `--focus 'DiT,diffusion transformer,ViT'`:
+  papers whose abstract or method section mentions one rank first, marked `focus:`; the rest stay, below them.
 
 To call it by name: `/citation-snowball <paper>` in Claude Code (`/citation-snowball:citation-snowball <paper>` with
 the plugin), or mention `$citation-snowball` in Codex.
@@ -102,7 +104,8 @@ A helper script does the API work, and your agent supplies the judgment.
 
 - **The script** reads the paper's tables, counts what the paper and the works it compares against cite in common
   (co-citation), screens the papers that cite it, and finds code on GitHub and Hugging Face.
-- **The agent** confirms the comparison set, chooses the topic keywords and writes the one-line reasons.
+- **The agent** confirms the comparison set, chooses the topic keywords and the focus phrases, and writes the
+  one-line reasons.
 
 Data comes from Semantic Scholar, arXiv, Hugging Face, GitHub and OpenAlex. Google Scholar is never queried, so
 citation counts are Semantic Scholar's.

@@ -15,6 +15,8 @@ Stages (each reads/writes JSON in a work directory):
                  README docs, saves the whole screened pool, then runs `select`      -> pool.json (+ select's outputs)
   select         apply the influence gates and size caps to pool.json (offline apart from cached lookups), fetch
                  abstracts, BibTeX and code for the kept papers -> candidates.json briefs.md
+                 --focus PHRASES reads the gate passers' abstracts and arXiv-HTML method sections and ranks the papers
+                 that mention a phrase first (the gates are unchanged)
   report         render the reading map, merging the agent-written diffs.json -> report.md references.bib
 
 Helpers: doctor (check APIs, keys, tools, updates) | update (git pull this skill) | resolve SEED | code ID...
@@ -1038,18 +1040,53 @@ def recover_refs_from_bib(http: Http, digest: dict, refs: list, max_titles: int,
     return new
 
 
+def arxiv_html(http: Http, arxiv: str) -> tuple:
+    """-> (url, LaTeXML HTML) of an arXiv paper, from arxiv.org or, for older papers, ar5iv; (None, None) when neither
+    has it. Cached for 60 days."""
+    for url in ("https://arxiv.org/html/%s" % arxiv, "https://ar5iv.labs.arxiv.org/html/%s" % arxiv):
+        try:
+            page = http.fetch(url, as_json=False, ttl_days=60)
+        except HttpFailure as err:
+            log("  %s: %s" % (url, err))
+            continue
+        if page and ("ltx_page_main" in page or "ltx_document" in page):
+            return url, page
+    return None, None
+
+
+FRONT_MATTER_RE = re.compile(r"acknowledg|ethic|broader impact|reproducib|funding|author contribution|"
+                             r"data availability", re.I)
+
+
+def method_text(http: Http, arxiv: str) -> str | None:
+    """The text of the paper's method sections, for --focus: every top-level section whose heading reads as none of
+    introduction, related work, experiments or conclusion (section_kind()), with its subsections: "3 Method", a section
+    named after the model ("3 Diffusion Transformers"), a dataset paper's "3 Data Collection". The excluded sections
+    name prior work and baselines, not what the paper builds on, and so are the appendices and the acknowledgements and
+    ethics statements (funders and affiliations would match a focus phrase). Subsection headings are not consulted:
+    "5.1 State-of-the-Art Diffusion Models" under "5 Experiments" is a results subsection, whatever its title says.
+    "" when every section is excluded, None without HTML."""
+    _, page = arxiv_html(http, arxiv)
+    if not page:
+        return None
+    parts = []
+    for n in parse_html(page).iter():
+        if n.tag != "section" or "ltx_section" not in n.classes:
+            continue
+        heading = next((k for k in n.iter() if k is not n and k.tag in ("h2", "h3") and "ltx_title" in k.classes), None)
+        title = heading.text() if heading is not None else ""
+        if title and section_kind(title) in ("method", "dataset", "other") and not FRONT_MATTER_RE.search(title):
+            parts.append(n.text())
+    return " ".join(parts)
+
+
 def fetch_fulltext(http: Http, seed: dict, workdir: str) -> tuple:
     """Returns (source_url, html_text_or_None, plain_text_or_None, pdf_path_or_None)."""
     arxiv = (seed.get("externalIds") or {}).get("ArXiv")
     if arxiv:
-        for url in ("https://arxiv.org/html/%s" % arxiv, "https://ar5iv.labs.arxiv.org/html/%s" % arxiv):
-            try:
-                page = http.fetch(url, as_json=False, ttl_days=60)
-            except HttpFailure as err:
-                log("  %s: %s" % (url, err))
-                continue
-            if page and ("ltx_page_main" in page or "ltx_document" in page):
-                return url, page, None, None
+        url, page = arxiv_html(http, arxiv)
+        if page:
+            return url, page, None, None
     pdf_url = ((seed.get("openAccessPdf") or {}).get("url")) or (("https://arxiv.org/pdf/%s" % arxiv) if arxiv else None)
     if pdf_url:
         pdf = os.path.join(workdir, "paper.pdf")
@@ -2110,7 +2147,7 @@ def cmd_core(args) -> None:
 
 SELECT_DEFAULTS = {"min_forward": 8, "max_follow_ups": 15, "max_foundations": 6, "max_latest": 8, "max_also": 20,
                    "expand": "auto", "min_citations": 0, "min_docs": 4, "recent_months": 12, "mid_months": 24,
-                   "latest_months": 30, "min_coupling": 1, "min_area": 30}
+                   "latest_months": 30, "min_coupling": 1, "min_area": 30, "focus": []}
 
 
 def selection_config(args, base: dict | None = None) -> dict:
@@ -2120,6 +2157,8 @@ def selection_config(args, base: dict | None = None) -> dict:
     for k in SELECT_DEFAULTS:
         if getattr(args, k, None) is not None:
             cfg[k] = getattr(args, k)
+    if isinstance(cfg["focus"], str):  # from the command line: comma-separated phrases ('' turns a saved focus off)
+        cfg["focus"] = [p.strip() for p in cfg["focus"].split(",") if p.strip()]
     gates = {k: tuple(v) for k, v in (base.get("gates") or GATES).items()}
     if getattr(args, "max_forward", None) is not None:  # 1.2 flag
         log("  --max-forward is deprecated; it now sets --max-follow-ups.")
@@ -2268,6 +2307,21 @@ def topic_hits(p: dict, keywords: list) -> list:
     return [k for k in keywords if (" %s " % k) in title or (" " in k and (" %s " % k) in abstract)]
 
 
+def phrase_hits(text: str | None, phrases: list) -> list:
+    """The --focus phrases found in `text` as whole words, in the order given. Both sides are normalized, so "DiT"
+    matches "DiT-XL/2" and "DiTs", and "diffusion transformer" matches "Diffusion Transformers"."""
+    hay = " %s " % norm(text)
+    return [p for p in phrases if norm(p) and re.search(" %ss? " % re.escape(norm(p)), hay)]
+
+
+def focus_first(recs: list, n: int) -> list:
+    """balanced_pick, but the papers that mention a --focus phrase (rec["focus"]) take the slots first: the user asked
+    for them, so a matching paper outranks a stronger one that does not match. Without --focus nothing is marked and
+    this is balanced_pick."""
+    hits = balanced_pick([r for r in recs if r.get("focus")], n)
+    return hits + balanced_pick([r for r in recs if not r.get("focus")], n - len(hits))
+
+
 def dedupe_titles(recs: list, against: list = ()) -> list:
     """Semantic Scholar sometimes has two records for one paper (e.g. "Semantic-SAM: X" and the venue version "X").
     Keep the first, best-ranked record of each title, and drop records duplicating one in `against`."""
@@ -2408,7 +2462,7 @@ def latest_models(co: dict, stats: dict, exclude: set, cfg: dict) -> list:
 
 
 def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date, skip_keys=frozenset(),
-                  kinds: dict | None = None) -> dict:
+                  kinds: dict | None = None, focus: dict | None = None) -> dict:
     """Split the screened pool into the report's sections. Pure: no network.
 
     compared     (A1) included core papers with a table role: every one, no citation bar
@@ -2422,6 +2476,8 @@ def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date
     also              gate passers beyond the caps, and surveys after the first
     `skip_keys` are 8-character keys the agent excluded in diffs.json: they leave every section, so the next
     candidates move up. `kinds` maps keys to "data" / "model" where the agent corrected an A2 classification.
+    `focus` maps paperIds to where the --focus phrases were found (focus_hits()): those papers take B's slots first
+    and are marked in every section; nothing else changes.
     """
     seed_ids = {s["paperId"] for s in seeds}
     seed_key = {s["paperId"]: s["key"] for s in seeds}
@@ -2439,6 +2495,7 @@ def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date
     compared.sort(key=lambda c: (ROLE_ORDER.get(c["role"], 9), -(c.get("citationCount") or 0)))
     related.sort(key=lambda c: -(c.get("score") or 0))
     compared_ids = {c["paperId"] for c in compared}
+    focus = focus or {}
 
     co = pool.get("cocitation") or {}
     stats = cocite_stats(co, today)
@@ -2461,7 +2518,7 @@ def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date
         core_hits = sorted(cited & core_ids, key=lambda c: cites_of[c])  # most specific (least cited) first
         core_score = sum(weight[c] for c in core_hits)
         row = dict(rec, cites_seeds=sorted(seed_key[s] for s in cited & seed_ids), n_core=len(core_hits),
-                   core_score=core_score, topical=topical, coupling=coupling,
+                   core_score=core_score, topical=topical, coupling=coupling, focus=focus.get(pid),
                    builds_on=[name_of[c] for c in core_hits if weight[c] == 1.0][:4] or [name_of[c] for c in core_hits][:4])
         if row["cites_seeds"]:
             reason = gate(rec, "seed", cfg, today) if same_area else None
@@ -2488,13 +2545,13 @@ def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date
     # One survey per section is useful for a newcomer; more crowd out primary work (they go to "also").
     seed_pass, seed_surveys = one_survey(seed_pass)
     expand_pass, expand_surveys = one_survey(expand_pass)
-    seed_kept = balanced_pick(seed_pass, cfg["max_follow_ups"])
+    seed_kept = focus_first(seed_pass, cfg["max_follow_ups"])
     show_expand = expanded and (cfg["expand"] == "always"
                                 or (cfg["expand"] == "auto" and len(seed_pass) < cfg["min_forward"]))
     if show_expand and seed_kept and any(SURVEY_RE.search(r.get("title") or "") for r in seed_kept):
         expand_pass, more = one_survey([{"title": "survey"}] + expand_pass)  # the section already has its survey
         expand_pass, expand_surveys = expand_pass[1:], expand_surveys + more
-    expand_kept = balanced_pick(expand_pass, max(cfg["max_follow_ups"] - len(seed_kept), 0)) if show_expand else []
+    expand_kept = focus_first(expand_pass, max(cfg["max_follow_ups"] - len(seed_kept), 0)) if show_expand else []
     follow_ups = seed_kept + expand_kept
     kept_ids = {r["paperId"] for r in follow_ups}
     also = [r for r in seed_pass + seed_surveys + ((expand_pass + expand_surveys) if show_expand else [])
@@ -2502,7 +2559,7 @@ def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date
     for r in also:
         r.pop("abstract", None)  # the report lists these by title only
         r["section"] = "also"
-    also.sort(key=lambda r: -r["score"])
+    also.sort(key=lambda r: (not r.get("focus"), -r["score"]))
 
     # `core --exclude` keeps a paper out of the comparison set and the citer search (hubs such as SAM), not out of A2
     # and C: a widely co-cited hub is a foundation. EXCLUDE in diffs.json removes it from the report.
@@ -2512,6 +2569,8 @@ def select_papers(pool: dict, seeds: list, core: list, cfg: dict, today: dt.date
     related = [r for r in related if r["paperId"] not in found_ids]
     latest = latest_models(co, stats, taken | found_ids | kept_ids, cfg)
     latest = dedupe_titles(latest, against=backward + found + follow_ups)
+    for r in compared + related + found + latest:  # B rows carry theirs already; the other sections only get the mark
+        r["focus"] = focus.get(r["paperId"])
     for r in follow_ups:  # a follow-up that recent work already builds on is worth saying so
         s = stats.get(r["paperId"])
         if s and s["share"] >= COCITE["latest_share"] and s["support"] >= COCITE["latest_support"]:
@@ -2863,13 +2922,48 @@ def cmd_select(args) -> None:
     run_select(wd, seeds, core, pool, cfg, Http(args.cache_dir), args)
 
 
+FOCUS_CAP = 150  # papers whose abstract and arXiv HTML --focus reads, strongest first (about a second each, cached)
+
+
+def focus_hits(http: Http, phrases: list, recs: list) -> tuple:
+    """-> ({paperId: {"abstract": [phrases found], "method": [...]}} for the papers that mention a --focus phrase, how
+    many papers were checked, how many of them had arXiv HTML to read a method section from). Abstracts are Semantic
+    Scholar's; the first FOCUS_CAP records are checked, in the order given."""
+    recs = list({r["paperId"]: r for r in recs if r.get("paperId")}.values())[:FOCUS_CAP]
+    need = [r["paperId"] for r in recs if not r.get("abstract")]
+    details = s2_batch(http, need, fields=PAPER_FIELDS + ",abstract") if need else {}
+    hits, with_html = {}, 0
+    for r in recs:
+        d = details.get(r["paperId"]) or {}
+        arxiv = (r.get("externalIds") or {}).get("ArXiv") or (d.get("externalIds") or {}).get("ArXiv")
+        method = method_text(http, arxiv) if arxiv else None
+        if method is not None:
+            with_html += 1
+        found = {}
+        for where, text in (("abstract", r.get("abstract") or d.get("abstract")), ("method", method)):
+            if phrase_hits(text, phrases):
+                found[where] = phrase_hits(text, phrases)
+        if found:
+            hits[r["paperId"]] = found
+    return hits, len(recs), with_html
+
+
 def run_select(wd: str, seeds: list, core: list, pool: dict, cfg: dict, http: Http, args) -> None:
-    """Select, then fetch abstracts, BibTeX and code for the kept papers, and write candidates.json + briefs.md."""
+    """Select, then fetch abstracts, BibTeX and code for the kept papers, and write candidates.json + briefs.md. With
+    --focus, select twice: the first pass finds the gate passers, whose abstracts and method sections are then read, and
+    the second ranks the ones that mention a focus phrase first."""
     today = dt.date.today()
     diffs = load_diffs(wd)
     skip = {k for k, d in diffs.items() if d["exclude"]}
     kinds = {k: d["kind"] for k, d in diffs.items() if d.get("kind")}
     sel = select_papers(pool, seeds, core, cfg, today, skip_keys=skip, kinds=kinds)
+    focus_checked = focus_read = None
+    if cfg.get("focus"):
+        cands = sel["follow_ups"] + sel["also"] + sel["compared"] + sel["latest"] + sel["foundations"]
+        log("Focus on %s: reading the abstracts and method sections (arXiv HTML) of up to %d papers ..."
+            % (", ".join(cfg["focus"]), min(len(cands), FOCUS_CAP)))
+        hits, focus_checked, focus_read = focus_hits(http, cfg["focus"], cands)
+        sel = select_papers(pool, seeds, core, cfg, today, skip_keys=skip, kinds=kinds, focus=hits)
     kept = sel["compared"] + sel["foundations"] + sel["follow_ups"] + sel["latest"]
     details = s2_batch(http, [r["paperId"] for r in kept + sel["related"]], fields=KEPT_FIELDS)
     for r in kept + sel["related"]:
@@ -2888,6 +2982,7 @@ def run_select(wd: str, seeds: list, core: list, pool: dict, cfg: dict, http: Ht
     meta = dict(pool["meta"], selected=today.isoformat(), selection={k: v for k, v in cfg.items()},
                 expand_shown=sel["expanded"], expand_why=sel["expand_why"], n_seed_pass=sel["n_seed_pass"],
                 n_expand_pass=sel["n_expand_pass"], excluded_by_review=sorted(skip),
+                focus_checked=focus_checked, focus_read=focus_read,
                 cocitation={"backward_set": len(co.get("backward_set") or []), "backward_have": co.get("backward_have") or 0,
                             "area_size": co.get("area_size") or 0, "coupling_set": len(sel["coupling_set"])})
     meta["selection"]["gates"] = {k: list(v) for k, v in cfg["gates"].items()}
@@ -2914,6 +3009,7 @@ def paper_record(r: dict, today: dt.date) -> dict:
         "eligible": r.get("eligible"), "share_f": r.get("share_f"), "twins": r.get("twins") or [],
         "found_via": r.get("sources") or (["co-citation"] if r["section"] in ("foundation", "latest") else ["backward"]),
         "verified": r.get("verified"), "evidence": r.get("evidence") or [], "code": r.get("code"),
+        "focus": r.get("focus"),
     }
 
 
@@ -2955,6 +3051,12 @@ def why_kept(p: dict) -> str:
     return "%s; %s%s" % (base, p.get("gate"), extra)
 
 
+def focus_note(p: dict) -> str:
+    """Where a paper mentions the --focus phrases: "DiT, ViT (abstract); DiT (method)", or "" when it does not."""
+    found = p.get("focus") or {}
+    return "; ".join("%s (%s)" % (", ".join(found[w]), w) for w in ("abstract", "method") if found.get(w))
+
+
 def write_briefs(wd: str, seeds: list, papers: list) -> None:
     lines = ["# Briefs for writing diffs.json", ""]
     for s in seeds:
@@ -2964,6 +3066,9 @@ def write_briefs(wd: str, seeds: list, papers: list) -> None:
     lines += ["Write diffs.json as {\"<key>\": \"one sentence: why read it - what it contributes and how it differs from "
               "the seed\"}. Use \"EXCLUDE: <reason>\" to drop an off-topic paper (then re-run `select` to backfill), and "
               "{\"diff\": \"...\", \"pick\": 1} to put a paper in \"Read these first\".", ""]
+    if any(p.get("focus") for p in papers):
+        lines += ["A `focus:` note says where the user's focus phrases appear (abstract, method section). Say in the "
+                  "sentence how the paper uses them, and prefer these papers for picks.", ""]
     for p in papers:
         if p["section"] not in SECTION_LETTER:
             continue
@@ -2973,8 +3078,9 @@ def write_briefs(wd: str, seeds: list, papers: list) -> None:
         why = why_kept(p)
         if p["section"] == "compared":
             why = "%s (%s)" % (why, "; ".join(p.get("evidence") or [])[:160])
-        lines.append("## %s | %s (%s) | %s cites | %s | %s | %s" % (
-            p["key"], p["title"], p.get("year"), p.get("citationCount"), SECTION_LABEL[p["section"]], why, code))
+        lines.append("## %s | %s (%s) | %s cites | %s | %s | %s%s" % (
+            p["key"], p["title"], p.get("year"), p.get("citationCount"), SECTION_LABEL[p["section"]], why, code,
+            " | focus: %s" % focus_note(p) if p.get("focus") else ""))
         lines.append(p.get("tldr") or (p.get("abstract") or "")[:700] or "(no abstract available - judge from the title or skim the paper)")
         lines.append("")
     with open(os.path.join(wd, "briefs.md"), "w", encoding="utf-8") as fh:
@@ -3007,6 +3113,12 @@ def print_select_summary(wd: str, papers: list, meta: dict, diffs: dict) -> None
           % (len(kept), len(by.get("compared", [])), len(by.get("foundation", [])), len(by.get("follow_up", [])),
              " (%d by widening)" % widened if widened else "", len(by.get("latest", [])), len(by.get("also", []))))
     print("WIDEN   %s: %s" % ("yes" if meta["expand_shown"] else "no", meta["expand_why"]))
+    focus = (meta.get("selection") or {}).get("focus")
+    if focus:
+        print("FOCUS   %s: %d of %d kept papers mention it (B: %d of %d); method sections read for %d of %d papers "
+              "checked" % (", ".join(focus), sum(1 for p in kept if p.get("focus")), len(kept),
+                           sum(1 for p in by.get("follow_up", []) if p.get("focus")), len(by.get("follow_up", [])),
+                           meta.get("focus_read") or 0, meta.get("focus_checked") or 0))
     if meta.get("s2_busy_retries"):
         print("NOTE    %d retries against Semantic Scholar's busy keyless pool; an S2_API_KEY makes runs much faster."
               % meta["s2_busy_retries"])
@@ -3024,9 +3136,10 @@ def print_select_summary(wd: str, papers: list, meta: dict, diffs: dict) -> None
     print("  key       sec  cites   year  code                          title | why kept")
     for sec in ("compared", "foundation", "follow_up", "latest"):
         for p in by.get(sec, []):
+            why = ("focus: %s | " % focus_note(p) if p.get("focus") else "") + why_kept(p)
             print("  %-9s %-4s %6s  %-5s %-29s %s | %s" % (p["key"], SECTION_LETTER[sec], p.get("citationCount"),
                                                           p.get("year") or "", code_brief(p)[:29], (p["title"] or "")[:60],
-                                                          why_kept(p)[:80]))
+                                                          why[:80]))
 
 
 def load_diffs(wd: str) -> dict:
@@ -3152,12 +3265,16 @@ def auto_picks(sections: dict, n: int) -> list:
     papers (citations + stars), the 2 best follow-ups and the 2 most-used latest models, then the next best overall."""
     def strength(p):
         return math.log10(1 + (p.get("citationCount") or 0)) + 0.5 * math.log10(1 + ((best_repo(p) or {}).get("stars") or 0))
-    groups = [[p for p in sections["foundation"] if p.get("kind") == "data"],  # ranked by co-citation score
-              sorted(sections["compared"], key=lambda p: -strength(p)),
-              sorted(sections["follow_up"], key=lambda p: -(p.get("score") or 0)),
-              sections["latest"]]  # ranked by share
+
+    def focus_first(rows):  # with --focus, the papers that mention a phrase come first (stable: ranks kept otherwise)
+        return sorted(rows, key=lambda p: not p.get("focus"))
+    groups = [focus_first([p for p in sections["foundation"] if p.get("kind") == "data"]),  # by co-citation score
+              focus_first(sorted(sections["compared"], key=lambda p: -strength(p))),
+              focus_first(sorted(sections["follow_up"], key=lambda p: -(p.get("score") or 0))),
+              focus_first(sections["latest"])]  # ranked by share
     picks = [p for group in groups for p in group[:2]]
-    rest = [p for group in groups for p in group[2:]] + [p for p in sections["foundation"] if p.get("kind") != "data"]
+    rest = focus_first([p for group in groups for p in group[2:]]
+                       + [p for p in sections["foundation"] if p.get("kind") != "data"])
     for p in rest:
         if len(picks) >= n:
             break
@@ -3284,6 +3401,12 @@ def render_report(data: dict, seeds: list, diffs: dict, n_picks: int = 8) -> tup
                      len(kept), sum(1 for p in kept if has_code(p)), "{:,}".format(meta.get("pool") or 0),
                      meta.get("selected") or meta.get("generated")))
     lines.append("")
+    focus = (meta.get("selection") or {}).get("focus") or []
+    if focus:
+        lines.append("**Focus:** %s · %d of %d papers mention it in the abstract or method section (marked \"focus\" "
+                     "below); they rank first in B and in the automatic read-first picks." % (
+                         md_escape(", ".join(focus)), sum(1 for p in kept if p.get("focus")), len(kept)))
+        lines.append("")
 
     h_a1 = "A1. What %s compare%s against" % (the_seed, "" if multi else "s")
     h_a2 = "A2. What the field builds on"
@@ -3306,7 +3429,8 @@ def render_report(data: dict, seeds: list, diffs: dict, n_picks: int = 8) -> tup
         code = (" · [%s](%s) ★%s" % (repo["repo"], repo["url"], human(repo.get("stars")))) if repo else ""
         lines.append("%d. %s · %s · %s citations%s  " % (i, paper_md(p), p.get("year") or "?", human(p.get("citationCount")), code))
         text = diff_of(p)["text"]
-        lines.append("   %s%s" % (pick_reason(p, seeds_by_key), (" " + md_escape(text)) if text else ""))
+        note = " Focus: %s." % md_escape(focus_note(p)) if p.get("focus") else ""
+        lines.append("   %s%s%s" % (pick_reason(p, seeds_by_key), note, (" " + md_escape(text)) if text else ""))
     lines.append("")
 
     def table(rows, extra=None):
@@ -3317,6 +3441,8 @@ def render_report(data: dict, seeds: list, diffs: dict, n_picks: int = 8) -> tup
             paper = paper_md(p)
             if p.get("twins"):
                 paper += "<br><sub>also published as %s</sub>" % md_escape("; ".join(p["twins"]))
+            if p.get("focus"):
+                paper += "<br><sub>focus: %s</sub>" % md_escape(focus_note(p))
             cells = [str(i), paper, str(p.get("year") or ""), cites_md(p), code_md(p)]
             if extra:
                 cells.append(extra[1](p))
@@ -3417,9 +3543,11 @@ def render_report(data: dict, seeds: list, diffs: dict, n_picks: int = 8) -> tup
     if also:
         lines += ["<details><summary>Also qualified, beyond the size caps (%d, not reviewed)</summary>" % len(also), ""]
         for p in also:
-            lines.append("- %s (%s) · %s · %s" % (paper_md(p), p.get("year") or "?", md_escape(p.get("gate")),
-                                                   "cites the seed" if p.get("route") == "seed" else
-                                                   "builds on " + md_escape(", ".join(p.get("builds_on") or []))))
+            lines.append("- %s (%s) · %s · %s%s" % (
+                paper_md(p), p.get("year") or "?", md_escape(p.get("gate")),
+                "cites the seed" if p.get("route") == "seed" else
+                "builds on " + md_escape(", ".join(p.get("builds_on") or [])),
+                " · focus: %s" % md_escape(focus_note(p)) if p.get("focus") else ""))
         lines += ["", "</details>", ""]
     if excluded:
         lines += ["<details><summary>Excluded after review (%d)</summary>" % len(excluded), ""]
@@ -3466,6 +3594,13 @@ def render_report(data: dict, seeds: list, diffs: dict, n_picks: int = 8) -> tup
                      sel["latest_months"], pct(COCITE["latest_share"]), COCITE["latest_support"], COCITE["min_eligible"]))
     if sel.get("min_citations"):
         lines.append("- A hard floor of ≥%d citations applied to B (stars could not replace it)." % sel["min_citations"])
+    if focus:
+        lines.append("- **Focus** = %s. A paper is marked when its Semantic Scholar abstract or the method section of "
+                     "its arXiv HTML mentions one of these phrases as a whole word (any case; plurals count). Marked "
+                     "papers take B's slots and the automatic read-first picks first; the gates and the other "
+                     "sections' order are unchanged. Method sections were read for %d of the %d papers checked; the "
+                     "rest have no arXiv HTML." % (md_escape(", ".join(focus)), meta.get("focus_read") or 0,
+                                                   meta.get("focus_checked") or 0))
     lines.append("- Screened %s papers (%s citing %s%s); %d reference lists checked. Sources: Semantic Scholar "
                  "(citations, references, counts, BibTeX), arXiv, Hugging Face and GitHub (code, stars, READMEs)%s. "
                  "Google Scholar is never queried. Generated by citation-snowball %s on %s." % (
@@ -3599,6 +3734,11 @@ def add_selection_args(p, defaults: bool) -> None:
                    help="age of the 'recent' bracket in months (default 12)" + note)
     p.add_argument("--mid-months", type=int, default=d["mid_months"],
                    help="age of the 'mid' bracket in months (default 24)" + note)
+    p.add_argument("--focus", metavar="PHRASES",  # no default: selection_config() falls back to the saved or empty list
+                   help="what the user is looking for among the results, comma-separated, e.g. 'DiT,diffusion "
+                        "transformer,ViT': papers whose abstract or arXiv-HTML method section mentions one rank first "
+                        "in B and the read-first list and are marked in every section; the gates are unchanged ('' "
+                        "turns it off)" + note)
     # 1.2 flags, kept (deprecated) so old commands still run
     p.add_argument("--max-forward", type=int, help=argparse.SUPPRESS)
     p.add_argument("--max-backward", type=int, help=argparse.SUPPRESS)

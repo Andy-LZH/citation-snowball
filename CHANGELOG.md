@@ -7,8 +7,32 @@ what counts as major, minor and patch here.
 
 ## [Unreleased]
 
+### Added
+
+- **`--focus PHRASES`: say what you are looking for.** "Among these, the ones that use a DiT" →
+  `--focus 'DiT,diffusion transformer,ViT'` on `forward` or `select`.
+  - After the gates, the script reads each gate passer's Semantic Scholar abstract and the method section of its
+    arXiv HTML (the body sections that are not introduction, related work, experiments or conclusion, with their
+    subsections) and marks the papers that mention a phrase as a whole word (plurals and `DiT-XL/2` count).
+  - Marked papers take section B's slots and the automatic "Read these first" picks first. The gates and the other
+    sections' order are unchanged, so a weak paper never gets in for matching.
+  - The report shows a **Focus** line, a `focus: DiT (abstract); ViT (method)` note under each matching title, and
+    the counts in the footnote. `select` prints a `FOCUS` line, and `briefs.md` carries the note so the agent's
+    sentence can say how the paper uses it.
+  - Up to 150 papers are read, about a second each the first time and cached afterwards, so a focus can be added or
+    changed with `select` without searching again.
+
 ### Changed
 
+- **SKILL.md opens with "How to work":** four habits in the shape of
+  [Karpathy's coding guidelines](https://github.com/multica-ai/andrej-karpathy-skills) (pin down the question before
+  searching, the shortest map that answers it, surgical edits, verify against the seed then loop). The former "Rules"
+  section moved into them; the workflow steps are unchanged apart from `--focus`.
+- **Why Google Scholar stays out, with sources.**
+  [`references/data-sources.md` §7](references/data-sources.md#7-google-scholar-not-used-and-why) now cites Google
+  Scholar's help page and robots.txt, the Stack Overflow thread on the missing API, and what the free tools
+  (scholar.py, archived in 2026 and unchanged since 2017; `scholarly`) and the paid services (SerpApi, Scrapeless)
+  do, and why none fits a tool that must stay free, dependency-free and within the site's policy.
 - **A shorter README, in the order you need it:** prerequisites (with where to get a Semantic Scholar key), then
   install (the Claude Code plugin first), use, and what you get. The flow diagram and the limitations moved to
   [`references/methodology.md`](references/methodology.md).

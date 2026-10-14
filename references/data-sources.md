@@ -133,15 +133,39 @@ reads Crossref's deposited reference DOIs and resolves them in Semantic Scholar.
 
 ## 7. Google Scholar: not used, and why
 
-Google Scholar has no API. Its robots.txt disallows `/scholar` (searches, "Cited by" lists, versions) for all
-automated clients, and Google's Terms of Service forbid automated access that violates robots.txt or bypasses its
-protective measures. Automated traffic can also get the user's whole network CAPTCHA-blocked. So:
+Google Scholar has no API. Its [robots.txt](https://scholar.google.com/robots.txt) disallows `/scholar` (searches,
+"Cited by" lists, versions) and `/citations?` (profiles beyond their first page) for all automated clients, and
+Google's Terms of Service forbid automated access that violates robots.txt or bypasses its protective measures.
+Google Scholar's own [help page](https://scholar.google.com/intl/en/scholar/help.html) asks: "please respect our
+robots.txt when you access Google Scholar using automated software", and says "Sorry, we're unable to provide bulk
+access." Automated traffic can also get the user's whole network CAPTCHA-blocked. So:
 
 - Never query it from the agent: no curl/fetch tools, no `scholarly` package, no SerpApi or proxy services, no
   browser automation on its search pages.
 - Instead, each report row has a **GS** link (`allintitle:"<title>"`) for the reader to click.
 - Google Scholar counts are usually 1.4-1.8x Semantic Scholar's (spot checks on 2026-10-06: LoRA 41.6k vs 23.9k,
   BERT 185k vs 122k, ResNet 344k vs 241k). Thresholds always apply to Semantic Scholar counts.
+
+**The free tools, checked on 2026-10-13.** The question comes up often:
+["Does Google Scholar have an API available that we can use in our research applications?"](https://stackoverflow.com/questions/62938110)
+(Stack Overflow, July 2020, 66k views). The accepted answer: Google does not provide one, and "it is not clear whether
+this is legal". The most-voted answer (2022) lists what exists, and every option either scrapes the pages robots.txt
+disallows or costs money:
+
+| Tool | What it is | Why not here |
+|---|---|---|
+| [ckreibich/scholar.py](https://github.com/ckreibich/scholar.py) | "a querier and parser for Google Scholar's output": a command-line scraper of the `/scholar` result pages. BSD-2-Clause per its README (the repo has no LICENSE file); 2.2k stars. | Archived by its author in July 2026 ("I am no longer maintaining this repository"), last code change February 2017, so it predates years of page changes; its open issues from 2017 to 2023 include repeated "does not work", "parser fails", "search query is not giving results any more" and "HTTP Error 503" reports. It fetches what robots.txt disallows, and its author "will never add features that intentionally try to work around the query limits imposed by Google Scholar". Neither will this project. |
+| [`scholarly`](https://pypi.org/project/scholarly/) | Python package scraping search, author and citation pages, with proxy support. | The same `/scholar` and `/citations?` scraping; the answer itself warns that "Google may block your IP". Also a third-party dependency, which the skill does not take. |
+| `scrape-google-scholar-py` | Another scraper. | Same. |
+| SerpApi, Scrapeless | Hosted scraping APIs that take the blocking on their side. | Paid (SerpApi has a free plan), still scraping on the user's behalf, and the skill has to work without accounts. |
+
+The licenses are not the obstacle: scholar.py's BSD-2-Clause would allow reuse with its copyright notice. Google
+Scholar's policy is, and so is reliability: a tool that stops working when the page layout changes or the network is
+CAPTCHA-blocked cannot carry a reading map's citation counts. The one path robots.txt allows, an author's profile page
+(`/citations?user=<id>`, first page only), gives that author's counts, not a seed paper's citers, so it does not serve
+this tool. Hence the design above: Semantic Scholar for counts, references and citers (§1), OpenAlex to find
+candidates (§5), Crossref as a fallback (§6), and a click-through link for the reader who wants Google Scholar's
+number. For Google Scholar data at scale, the help page's advice is to arrange it with the source of the data.
 
 ## 8. Caching and environment variables
 

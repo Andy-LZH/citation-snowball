@@ -360,6 +360,22 @@ what "prioritize the state of the art" means here. Stars count per month since t
 - **Duplicates removed.** Semantic Scholar sometimes has two records of one paper ("Semantic-SAM: X" and the venue
   version "X"); the better-ranked one is kept.
 
+**Focus (`--focus`).** When the user is looking for something specific among the results ("the ones that use a
+DiT"), the agent passes the phrases in the forms papers use (`DiT,diffusion transformer,ViT`). After the gates,
+`select` reads each gate passer's Semantic Scholar abstract and the method section of its arXiv HTML: every
+top-level section whose heading reads as none of introduction, related work, experiments or conclusion (the section
+kinds of [section 4](#4-how-reference-roles-are-inferred-backward)), with its subsections. That is "3 Method", a
+section named after the model ("3 Diffusion Transformers" in DiT), or a dataset paper's data-collection section. The
+excluded sections name prior work and baselines, not what the paper builds on; the appendices and the
+acknowledgements and ethics statements (funders, affiliations) are skipped too. Subsection headings are not consulted: "5.1 State-of-the-Art Diffusion Models" under "5 Experiments" is a results
+subsection whatever its title says, and "3.3 Baseline Method" under "3 The InstructPart Benchmark" is lost with its
+section (a benchmark paper's method then counts only through the abstract). A paper that mentions a phrase as a whole
+word (any case; plurals count, so `DiT` matches "DiTs" and "DiT-XL/2") is marked. Marked papers take B's slots first,
+each tier still balanced across lineages and best score first, then the automatic read-first picks. The gates are
+unchanged, so a match never gets a weak paper in, and A1, A2 and C keep their order and only carry the mark. Up to
+150 papers are read, follow-ups and the overflow first, then A1, C and A2, about a second each the first time and
+cached afterwards; the report's footnote says how many had HTML.
+
 **Agent exclusions.** A key marked `EXCLUDE` in `diffs.json` leaves every section, and `select` moves the next
 candidate up.
 
