@@ -36,6 +36,12 @@
       "prompt": "For InstructPart (2505.18291): which foundational datasets and models should I know, and which latest models should I keep an eye on for this task?",
       "expected_output": "Section A2 lists the datasets and benchmarks the seed and its compared works co-cite: ADE20K, COCO and the RefCOCO family appear, each with 'cited by k of n' and its share of recent work, and the two ADE20K records are merged into one row. A2 also lists models and methods such as CLIP, SAM and LLaVA. Section C lists SAM 3 and at least one Qwen-VL model (Qwen2.5-VL or Qwen3-VL), with the share of later area papers citing each. The reply explains that Semantic Scholar has no reference list for SAM 3 or Qwen2.5-VL, so they are found from the citing side.",
       "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "I like InstructPart (2505.18291). Among the papers that build on it or its baselines, I'm specifically looking for the ones that use a diffusion transformer (DiT, so a ViT-style backbone) rather than a CNN. Rank those first.",
+      "expected_output": "The agent passes --focus with the names papers use, e.g. 'DiT,diffusion transformer,ViT,vision transformer', on forward (or on select after a first run), and does not filter by hand. The select summary prints a FOCUS line with how many kept papers match and how many had arXiv HTML to read a method section from. The report has a 'Focus:' line under the counts, and each matching paper carries 'focus: ... (abstract)' or '(method)' under its title. In section B the matching papers come first and the other gate passers stay below them, and no paper gets in only for matching (the gates are unchanged). The agent's one-line reasons for the matching papers say how they use the transformer, and the reply states how many papers matched and that the rest are still listed.",
+      "files": []
     }
   ]
 }

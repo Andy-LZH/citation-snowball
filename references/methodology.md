@@ -360,6 +360,18 @@ what "prioritize the state of the art" means here. Stars count per month since t
 - **Duplicates removed.** Semantic Scholar sometimes has two records of one paper ("Semantic-SAM: X" and the venue
   version "X"); the better-ranked one is kept.
 
+**Focus (`--focus`).** When the user is looking for something specific among the results ("the ones that use a
+DiT"), the agent passes the phrases in the forms papers use (`DiT,diffusion transformer,ViT`). After the gates,
+`select` reads each gate passer's Semantic Scholar abstract and the method section of its arXiv HTML: every section
+or subsection whose heading reads as method ("Method", "Our Approach", "3.1 Architecture"), so a section named after
+the model still contributes its architecture subsection. Related work, experiments and the introduction are skipped:
+they name prior work and baselines, not what the paper itself builds on. A paper that mentions a phrase as a whole
+word (any case; plurals count, so `DiT` matches "DiTs" and "DiT-XL/2") is marked. Marked papers take B's slots first,
+each tier still balanced across lineages and best score first, then the automatic read-first picks. The gates are
+unchanged, so a match never gets a weak paper in, and A1, A2 and C keep their order and only carry the mark. Up to
+150 papers are read, follow-ups and the overflow first, then A1, C and A2, about a second each the first time and
+cached afterwards; the report's footnote says how many had HTML.
+
 **Agent exclusions.** A key marked `EXCLUDE` in `diffs.json` leaves every section, and `select` moves the next
 candidate up.
 

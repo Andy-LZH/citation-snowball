@@ -190,6 +190,25 @@ class Render(unittest.TestCase):
         self.assertIn("cited by at least 15% (and 4)", foot)
         self.assertIn("263 had reference lists", foot)
 
+    def test_focus_marks_matching_papers_and_explains_itself(self):
+        segzero = self.by_title("Seg-Zero")
+        segzero["focus"] = {"abstract": ["DiT"], "method": ["DiT", "ViT"]}
+        data = candidates(self.papers)
+        data["meta"]["selection"]["focus"] = ["DiT", "ViT"]
+        data["meta"]["focus_checked"], data["meta"]["focus_read"] = 12, 9
+        lines, _, _, _ = fbsearch.render_report(data, self.seeds, {})
+        text = "\n".join(lines)
+        self.assertIn("**Focus:** DiT, ViT · 1 of 11 papers mention it", text)
+        self.assertIn("<br><sub>focus: DiT (abstract); DiT, ViT (method)</sub>", text)
+        self.assertIn("Method sections were read for 9 of the 12 papers checked", text)
+        block = text.split("## Read these first", 1)[1].split("## A.", 1)[0]
+        self.assertIn("↪ Builds on LISA · 241 citations in 19 months. Focus: DiT (abstract); DiT, ViT (method).", block)
+
+    def test_without_focus_nothing_mentions_it(self):
+        text, _, _, _ = self.render()
+        self.assertNotIn("Focus", text)
+        self.assertNotIn("focus:", text)
+
 
 class MultiSeedRender(unittest.TestCase):
     def test_two_seeds(self):

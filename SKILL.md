@@ -35,8 +35,60 @@ weights). Counts are Semantic Scholar's.
 
 B is ranked by a SOTA score: citations per month plus half the stars per month (log scale), a small bonus for the
 last 12 months, and a penalty for surveys (at most one survey per section). A helper script does all the API work.
-You supply judgment at three checkpoints: the core set (step 2), the keywords that define the topic (step 3), and the
-one-line reasons, picks and dataset labels (step 4).
+You supply judgment at four checkpoints: what the user is looking for (step 0), the core set (step 2), the keywords
+that define the topic (step 3), and the one-line reasons, picks and dataset labels (step 4).
+
+## How to work
+
+Four habits, in the shape of [Karpathy's coding guidelines](https://github.com/multica-ai/andrej-karpathy-skills):
+they bias toward a short, defensible map over a long one. For a quick look-up ("who cites X?"), use judgment.
+
+### 1. Pin down the question before searching
+
+**Don't assume the topic. Surface what the request leaves open.**
+
+- Say which paper you resolved (title, year) and the type you take it for (method / dataset / benchmark / mixed)
+  before `forward`. If the seed is ambiguous, stop and ask.
+- The request usually maps to a flag; use it rather than filtering by hand: a citation floor → `--min-citations`,
+  "always the recent state of the art" → `--expand always`, "the ones that use a DiT" → `--focus`.
+- If two readings exist (foundations or follow-ups; one seed or several), name both and ask.
+- Ask before `forward`, not after `report`: a wrong topic costs a 5-20 minute run.
+
+### 2. The shortest map that answers it
+
+**Five stages, nothing speculative.**
+
+- No sections, flags, searches or extra reading beyond what was asked.
+- A short B with a `WIDEN` line is a result, not a failure. Don't pad it by relaxing gates the user did not ask about.
+- Hand over the report path and the few lines that matter, not a restatement of the report.
+
+### 3. Surgical edits
+
+**Change only what the paper supports, with the sources the script uses.**
+
+- Edit the core set with `core`: keep every main-table row, drop only components the seed merely uses.
+- One sentence per paper, from its brief. Don't rewrite rows the script filled in, reorder sections or edit the report.
+- Keep intermediate files in the workdir and hand the user the final report.
+- Only verified code links count: they put a paper's code in the table and are the only stars the gate accepts. Weak
+  matches are shown as "maybe ... (unverified)"; check one before calling it official.
+- **Never query Google Scholar** in any automated way: curl, fetch tools, the `scholarly` package, SerpApi, or a
+  browser on its search pages. It has no API, robots.txt disallows it, and Google blocks automated traffic. Citation
+  counts are Semantic Scholar's; say so (Google Scholar's are usually 1.4-1.8x higher). The report links each count
+  to a Google Scholar search so the user can check it themselves.
+
+### 4. Verify against the seed, then loop
+
+**Define what a good map looks like for this seed. Check the output against it.**
+
+```
+1. core set  → verify: every model row of the main results table is in A1 with a table role
+2. select    → verify: the WIDEN, COCITE and (with --focus) FOCUS lines make sense; every kept paper has a brief
+3. report    → verify: no "(to do)" cell, the .bib exists, the counts match the request
+```
+
+**This is working if:** questions about the seed come before `forward`, not after `report`; every paper in the map
+has one sentence and a reason it was kept; nothing was added or removed by hand without a reason in `diffs.json`;
+and the user gets the map with its counts and caveats in a few lines.
 
 ## Setup
 
@@ -73,6 +125,10 @@ one-line reasons, picks and dataset labels (step 4).
   - "Only papers with at least N citations" → `--min-citations N` (a hard floor for B; stars no longer count).
   - "Always include recent work on the baselines" → `--expand always`; "only papers citing the seed" →
     `--expand never`.
+  - "Among these, I'm looking for the ones that use a DiT" (a technique, architecture, input, domain) →
+    `--focus 'DiT,diffusion transformer,ViT'`: papers whose abstract or method section mentions a phrase are marked
+    and rank first in B and the read-first list. Give each name in the forms papers use (abbreviation and full
+    name). Nothing is filtered out and the gates do not move, so a match never gets a weak paper in.
   - Different bars → `--gate ROUTE.BRACKET=CITES[,STARS]`, e.g. `--gate seed.recent=5,100`; more or fewer rows →
     `--max-follow-ups`, `--max-foundations`, `--max-latest`; a longer "latest" window → `--latest-months 36` (see
     `forward --help`).
@@ -138,7 +194,7 @@ python3 <skill>/scripts/fbsearch.py core --workdir <WORKDIR> --add 2310.11454=ba
 ### 3. Forward
 
 ```
-python3 <skill>/scripts/fbsearch.py forward --workdir <WORKDIR> --query '<topic query>' --keywords '<phrases>'
+python3 <skill>/scripts/fbsearch.py forward --workdir <WORKDIR> --query '<topic query>' --keywords '<phrases>' [--focus '<phrases>']
 ```
 
 - `--keywords` defines the seed's topic: 6-15 comma-separated phrases. **Widening keeps only papers that match one**
@@ -149,6 +205,10 @@ python3 <skill>/scripts/fbsearch.py forward --workdir <WORKDIR> --query '<topic 
 - `--query` is a Semantic Scholar boolean query for the citation-sorted topic search used when widening. Join 3-7
   quoted key phrases with `|`, e.g. `'"interactive segmentation" | "part segmentation"'`. The syntax is `"phrase"`,
   `|` for OR, `+` for AND, `-` for NOT, and `prefix*`.
+- `--focus` is what the user is looking for among the results (step 0). After the gates, the script reads the
+  Semantic Scholar abstract and the arXiv-HTML method section of up to 150 gate passers (about a second each the
+  first time; cached) and ranks the ones that mention a phrase first. It works on `select` too, so a focus can be
+  added or changed after `forward` without searching again.
 - What it does, in order:
   1. Reads the reference lists of the seed and its compared works (with their citation sentences) and counts what
      they all cite.
@@ -161,8 +221,9 @@ python3 <skill>/scripts/fbsearch.py forward --workdir <WORKDIR> --query '<topic 
 
   It saves everything to `pool.json`, then runs `select`. That writes `candidates.json` and `briefs.md`, and prints the
   kept papers by section (`A1`, `A2`, `B`, `C`) with the reason each was kept.
-- Read the `WIDEN` line (whether B was widened and why) and the `COCITE` line (how many reference lists the
-  co-citation counts rest on).
+- Read the `WIDEN` line (whether B was widened and why), the `COCITE` line (how many reference lists the
+  co-citation counts rest on) and, with `--focus`, the `FOCUS` line (how many kept papers match, and how many had
+  arXiv HTML to read a method section from).
 
 ### 4. Write the one-line reasons, picks and labels
 
@@ -197,6 +258,9 @@ For example:
 - After any `kind` change or `EXCLUDE`, run `python3 <skill>/scripts/fbsearch.py select --workdir <WORKDIR>`. It takes
   seconds and is cached. The next candidates move up, and it lists the keys that still need a sentence.
 - Stick to what the brief supports. If a brief is empty, skim the paper or say what is known.
+- With `--focus`, a brief's header ends in `focus: DiT (abstract); ViT (method)`. Say in the sentence how the paper
+  uses it ("a DiT backbone with ..."), and prefer matching papers for picks; don't pick a non-matching paper over a
+  matching one without a reason.
 
 ### 5. Report
 
@@ -208,18 +272,9 @@ It writes the reading map and `<path>.bib`. Then reply with:
 
 - the report path and the counts per section (A1 / A2 / B / C, and how many have code), plus the `.bib` path;
 - the read-first list in a few lines, whether B was widened and why, and which latest models C found;
+- with `--focus`, how many of the kept papers mention it, and that the rest are still there, ranked below;
 - any caveat the script printed, e.g. a missing reference list, a non-arXiv seed, no GitHub token, few recent area
   papers, or many Semantic Scholar retries.
-
-## Rules
-
-- **Never query Google Scholar** in any automated way: curl, fetch tools, the `scholarly` package, SerpApi, or a
-  browser on its search pages. It has no API, robots.txt disallows it, and Google blocks automated traffic. The report
-  links each citation count to a Google Scholar search so the user can check counts themselves.
-- Citation counts are Semantic Scholar's; say so. Google Scholar's are usually 1.4-1.8x higher.
-- Only verified code links count: they put a paper's code in the table and are the only stars the gate accepts.
-  Weak matches are shown as "maybe ... (unverified)"; check one before calling it official.
-- Keep intermediate files in the workdir and hand the user the final report.
 
 ## Troubleshooting
 
@@ -236,6 +291,7 @@ It writes the reading map and `<path>.bib`. Then reply with:
 | A2 lists a paper in the wrong table | Set `"kind"` in `diffs.json`, then run `select`. |
 | B too thin | Add core papers, broaden `--keywords` / `--query`, relax a gate (`--gate seed.mid=15`), or `--min-coupling 0` if the same-area check is too strict for this seed; then re-run `forward`. |
 | B off-topic | Make `--keywords` more specific (drop bare generic words), remove generic models from the core set, re-run `forward`. |
+| `FOCUS` shows 0 matches, or fewer than expected | Add the forms papers use (`DiT` and `diffusion transformer`; `ViT` and `vision transformer`), check how many had arXiv HTML to read, then re-run `select --focus '...'` (cached, seconds). |
 | An expected paper is missing | Look it up in `pool.json`. Not in `papers` means it was never screened as a follow-up (add the core paper it builds on, or broaden the query). In `cocitation.meta` means it was counted for A2 / C but fell below the bars. |
 
 ## Reference files

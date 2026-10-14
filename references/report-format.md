@@ -16,8 +16,8 @@ writes there.
 | `seeds/<key>/core.json` | backward | this seed's proposed core set |
 | `core.json` | backward, `core` | the merged core set: every reference with `role`, `score`, `overlap`, `evidence`, `include`, `seeds` |
 | `pool.json` | forward | `meta` (settings, query, keywords, counts), `papers` (every follow-up candidate screened) and `cocitation` (the co-citation counts); see below |
-| `candidates.json` | select (run by forward) | `meta` (pool meta, settings used, widening reason, co-citation summary) and `papers`: the kept papers and those that also qualified |
-| `briefs.md` | select | one block per kept paper (TL;DR or abstract, why it was kept, code): the agent's input for `diffs.json` |
+| `candidates.json` | select (run by forward) | `meta` (pool meta, settings used, widening reason, co-citation summary, `focus_checked` / `focus_read` with `--focus`) and `papers`: the kept papers and those that also qualified |
+| `briefs.md` | select | one block per kept paper (TL;DR or abstract, why it was kept, code, where the `--focus` phrases appear): the agent's input for `diffs.json` |
 | `diffs.json` | the agent | the one-line reasons, picks, dataset labels and exclusions (see below) |
 | `report.md` | report | the reading map (or `--out <path>.md`) |
 | `report.bib` | report | BibTeX for every kept paper, next to the report (`--no-bib` to skip) |
@@ -75,6 +75,8 @@ Each record in `papers` has:
   - `coupling`: how many of the strongest backward co-citations a follow-up cites;
   - `builds_on`: the compared works it cites, most specific first;
   - `twins`: other records of the same dataset (A2);
+  - `focus` (with `--focus`): where the phrases were found, `{"abstract": ["DiT"], "method": ["DiT", "ViT"]}`, else
+    null;
   - `lineage`, `n_core`, `found_via`, `verified`, `evidence`.
 - **Code:** `code` is `{"github": [{"repo", "url", "stars", "source", "created", "docs", "docs_hits"}],
   "hf": [{"kind", "id", "url", "likes", "verified"}]}`. A GitHub `source` containing "verify" marks an unverified
@@ -106,11 +108,12 @@ One JSON object keyed by the 8-character keys. A value is one of:
 
 1. **Title and seed line(s):** `# Reading map: <short name>`, then one line per seed: title link, first author,
    short venue, year, citations, paper type.
-2. **Counts:** papers to read and how many have code, papers screened, search date.
+2. **Counts:** papers to read and how many have code, papers screened, search date. With `--focus`, a **Focus** line
+   with the phrases and how many papers mention them.
 3. **At a glance:** a table of the sections (Read these first, A1, A2, B, C) with their paper counts, how many have
    code, and their years. Each row links to its section.
 4. **Read these first:** 5-8 numbered picks with year, citations and repo with stars. Each has a ↩ / ↪ line saying
-   why it is there, followed by the agent's sentence:
+   why it is there, then `Focus: …` (where the `--focus` phrases appear, when set), then the agent's sentence:
    - compared in the seed;
    - a foundation, with how many cite it;
    - cites the seed, or builds on named compared works;
@@ -128,11 +131,13 @@ One JSON object keyed by the 8-character keys. A value is one of:
 8. **Also qualified,** collapsed, at most `--max-also` (20) follow-ups beyond the cap, with why they qualified.
 9. **Excluded after review,** collapsed.
 10. **How this map was made:** the exact bars used for A2, B and C, the recent area's definition and size, the
-    keywords, the query, what was screened, and the sources.
+    keywords, the query, the focus phrases and how many method sections were read, what was screened, and the
+    sources.
 
 **Table columns:** `# · Paper · Year · Cites · Code · [extra] · Why read it`.
 
-- **Paper** bolds the short name: `**LISA**: Reasoning Segmentation ...`.
+- **Paper** bolds the short name: `**LISA**: Reasoning Segmentation ...`. With `--focus`, a matching paper has a
+  `focus: DiT (abstract); ViT (method)` line under its title.
 - **Cites** is Semantic Scholar's count, linked to a Google Scholar title search the reader can click.
 - **Code** shows the best verified repo as `owner/repo ★stars · docs n/5`, and a verified Hugging Face artifact
   (`🤗 id ♥likes`). With neither, it shows `maybe owner/repo (unverified)` or `—`.
